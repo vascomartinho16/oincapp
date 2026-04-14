@@ -30,6 +30,22 @@ input,select,textarea{font-size:16px!important}
 <script type="text/babel" data-type="module">
 const{useState,useEffect,useCallback,useRef}=React;
 
+const APP_VERSION="11";
+
+/* ============ SHARED MODAL HEADER ============ */
+function ModalHeader({title,onClose,icon}){
+  return(<>
+    <div onClick={onClose} style={{width:"100%",display:"flex",justifyContent:"center",padding:"2px 0 10px",cursor:"pointer",marginTop:-8}}>
+      <div style={{width:44,height:5,borderRadius:3,background:"#D4B9A3"}}/>
+    </div>
+    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+      <button onClick={onClose} style={{display:"flex",alignItems:"center",gap:4,background:"none",border:"none",color:"#9A7B6A",fontSize:14,cursor:"pointer",padding:"6px 8px",fontFamily:"inherit"}}>← Voltar</button>
+      <button onClick={onClose} aria-label="Fechar" style={{width:34,height:34,borderRadius:"50%",border:"none",background:"#F0E4D8",color:"#3D2B1A",fontSize:18,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"inherit"}}>✕</button>
+    </div>
+    {title&&<div style={{fontSize:16,fontWeight:700,color:"#3D2B1A",marginBottom:14,textAlign:"center"}}>{icon?icon+" ":""}{title}</div>}
+  </>);
+}
+
 /* ============ CUSTOM SVG CHARTS (replaces Recharts) ============ */
 const fmt_=v=>{const n=Number(v);return isNaN(n)?v:n.toLocaleString("pt-PT",{style:"currency",currency:"EUR"});};
 
@@ -191,6 +207,36 @@ const SEED_TRANSACTIONS=[
 function loadLocal(){try{const d=localStorage.getItem(SK);return d?JSON.parse(d):null;}catch{return null;}}
 function saveLocal(data){try{localStorage.setItem(SK,JSON.stringify(data));}catch{}}
 
+function timeSince(ts){
+  if(!ts)return "";
+  const s=Math.floor((Date.now()-ts)/1000);
+  if(s<10)return "agora mesmo";
+  if(s<60)return "há "+s+"s";
+  const m=Math.floor(s/60);
+  if(m<60)return "há "+m+" min";
+  const h=Math.floor(m/60);
+  if(h<24)return "há "+h+"h";
+  const d=Math.floor(h/24);
+  return "há "+d+"d";
+}
+
+function downloadJSON(data,filename){
+  const blob=new Blob([JSON.stringify(data,null,2)],{type:"application/json"});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement("a");
+  a.href=url;a.download=filename;document.body.appendChild(a);a.click();
+  setTimeout(()=>{document.body.removeChild(a);URL.revokeObjectURL(url);},100);
+}
+
+function readJSONFile(file){
+  return new Promise((res,rej)=>{
+    const r=new FileReader();
+    r.onload=e=>{try{res(JSON.parse(e.target.result));}catch(err){rej(err);}};
+    r.onerror=()=>rej(new Error("Erro a ler ficheiro"));
+    r.readAsText(file);
+  });
+}
+
 // ============ SYNC via jsonblob.com ============
 const SYNC_ID_KEY="fm_sync_id";
 const SYNC_TS_KEY="fm_sync_ts";
@@ -279,7 +325,7 @@ async function syncRead(){
 
 async function syncWrite(data){
   const id=localStorage.getItem(SYNC_ID_KEY);
-  if(!id)return;
+  if(!id)return false;
   try{
     const body=JSON.stringify({ts:Date.now(),data});
     if(id.startsWith("NT:")){
@@ -288,7 +334,9 @@ async function syncWrite(data){
       const{url}=syncUrl(id);
       await fetch(url,{method:"PUT",headers:{"Content-Type":"application/json","Accept":"application/json"},body});
     }
-  }catch(e){console.error("syncWrite:",e);}
+    localStorage.setItem("fm_last_sync",String(Date.now()));
+    return true;
+  }catch(e){console.error("syncWrite:",e);return false;}
 }
 
 // ============ NOTIFICATIONS ============
@@ -638,8 +686,8 @@ function SyncModal({syncId,onSync,onJoin,onDisconnect,onClose}){
   const[joinCode,setJoinCode]=useState("");
   const[creating,setCreating]=useState(false);
   return<div style={S.ov} onClick={onClose}>
-    <div style={S.modal} onClick={e=>e.stopPropagation()}>
-      <div style={S.mTitle}>🔗 Sincronização</div>
+    <div style={{...S.modal,position:"relative"}} onClick={e=>e.stopPropagation()}>
+      <ModalHeader title="Sincronização" icon="🔗" onClose={onClose}/>
       {syncId?<div>
         <div style={{background:"#E8F4F0",borderRadius:12,padding:16,marginBottom:14,textAlign:"center"}}>
           <div style={{fontSize:11,color:"#4A7D6E",marginBottom:6,textTransform:"uppercase",letterSpacing:1}}>Código de Sincronização</div>
@@ -667,16 +715,16 @@ function SyncModal({syncId,onSync,onJoin,onDisconnect,onClose}){
 }
 
 // ============ SETTINGS MODAL ============
-function SettingsModal({notifsEnabled,onToggleNotifs,onOpenSync,onOpenCatModal,darkMode,onToggleDarkMode,onClose}){
+function SettingsModal({notifsEnabled,onToggleNotifs,onOpenSync,onOpenCatModal,darkMode,onToggleDarkMode,onClose,onExport,onImport,lastSyncAt,syncId}){
   return<div style={S.ov} onClick={onClose}>
-    <div style={S.modal} onClick={e=>e.stopPropagation()}>
-      <div style={S.mTitle}>⚙️ Definições</div>
+    <div style={{...S.modal,position:"relative",maxHeight:"88vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
+      <ModalHeader title="Definições" icon="⚙️" onClose={onClose}/>
       <div style={{...S.box,marginBottom:12,cursor:"pointer"}} onClick={onOpenSync}>
         <div style={{display:"flex",alignItems:"center",gap:10}}>
           <span style={{fontSize:24}}>🔗</span>
           <div style={{flex:1}}>
             <div style={{fontWeight:700,fontSize:14,color:"#3D2B1A"}}>Sincronização</div>
-            <div style={{fontSize:12,color:"#9A7B6A"}}>Partilhar dados entre telemóveis</div>
+            <div style={{fontSize:12,color:"#9A7B6A"}}>{syncId?(lastSyncAt?"Sincronizado "+timeSince(lastSyncAt):"Ativa — a aguardar sync..."):"Partilhar dados entre telemóveis"}</div>
           </div>
           <span style={{color:"#9A7B6A"}}>›</span>
         </div>
@@ -715,16 +763,36 @@ function SettingsModal({notifsEnabled,onToggleNotifs,onOpenSync,onOpenCatModal,d
           </button>
         </div>
       </div>
+      <div style={{...S.box,marginBottom:12,cursor:"pointer"}} onClick={onExport}>
+        <div style={{display:"flex",alignItems:"center",gap:10}}>
+          <span style={{fontSize:24}}>💾</span>
+          <div style={{flex:1}}>
+            <div style={{fontWeight:700,fontSize:14,color:"#3D2B1A"}}>Exportar backup</div>
+            <div style={{fontSize:12,color:"#9A7B6A"}}>Descarregar ficheiro JSON com tudo</div>
+          </div>
+          <span style={{color:"#9A7B6A"}}>›</span>
+        </div>
+      </div>
+      <label htmlFor="import-in" style={{...S.box,marginBottom:12,cursor:"pointer",display:"block"}}>
+        <div style={{display:"flex",alignItems:"center",gap:10}}>
+          <span style={{fontSize:24}}>📥</span>
+          <div style={{flex:1}}>
+            <div style={{fontWeight:700,fontSize:14,color:"#3D2B1A"}}>Restaurar backup</div>
+            <div style={{fontSize:12,color:"#9A7B6A"}}>Carregar ficheiro JSON anterior</div>
+          </div>
+          <span style={{color:"#9A7B6A"}}>›</span>
+        </div>
+      </label>
+      <input type="file" accept=".json,application/json" id="import-in" style={{display:"none"}} onChange={e=>{if(e.target.files[0])onImport(e.target.files[0]);e.target.value="";}}/>
       <div style={{...S.box,marginBottom:12}}>
         <div style={{display:"flex",alignItems:"center",gap:10}}>
           <span style={{fontSize:24}}>🐷</span>
           <div style={{flex:1}}>
             <div style={{fontWeight:700,fontSize:14,color:"#3D2B1A"}}>Família Martinho</div>
-            <div style={{fontSize:12,color:"#9A7B6A"}}>Versão 2.0 · Vasco & Sara</div>
+            <div style={{fontSize:12,color:"#9A7B6A"}}>Versão {APP_VERSION} · Vasco & Sara</div>
           </div>
         </div>
       </div>
-      <button style={S.closeBtn} onClick={onClose}>Fechar</button>
     </div>
   </div>;
 }
@@ -737,8 +805,8 @@ function CategoryModal({customCats,onAddCat,onDelCat,darkMode,onClose}){
   const EMOJI_LIST=["🍽️","🍕","🍔","🍣","☕","🍺","🍷","🛒","🥐","🥗","🚗","⛽","🚌","🚕","🚂","✈️","🏠","🛏️","🛋️","🚿","💡","🔧","💊","🏥","💉","🩺","🦷","👗","👔","👟","👜","🧢","💄","💇","🎭","🎮","🎬","🎵","🎸","📚","📖","📝","🎨","🏋️","⚽","🏊","🚴","🧘","💻","📱","🖨️","📷","🎧","👶","🍼","🎒","🧸","🐾","🐶","🐱","💍","🎁","🎉","🎂","🌺","🌳","🪴","📦","💼","💳","💸","💰","🏦","📊","📈","⚖️","🔑","🛠️","⚡","🧪","🔬","🎓","✏️","🖌️","🪞","🧴","🧻","🧹","🧺","🔋","🎟️","🎢","🏖️","⛱️","🏕️","🎿","⛷️","🏂","🎳","♟️","🎲","🃏","🎯","💈","🧿","🕯️","🧂","🍯","🥃","🍾","🧀","🥩","🍗","🍞","🥕","🍎","🫐","🍓","🍒","🥑","🌶️","🥦","🍫","🍬","🍭","🧁","🍰","🍦","🎀","💎","👑","⌚","🕰️","📺","🧳","🪑","🛁","🚽","🧼","🪥","🧽","💊","💊"];
   const getDarkColor=(light,dark)=>darkMode?dark:light;
   return<div style={S.ov} onClick={onClose}>
-    <div style={{...S.modal,maxHeight:"85vh",overflowY:"auto",WebkitOverflowScrolling:"touch",background:getDarkColor("#FEF5EC","#16213E"),color:getDarkColor("#3D2B1A","#E8E8E8")}} onClick={e=>e.stopPropagation()}>
-      <div style={S.mTitle}>📝 Gerenciar Categorias</div>
+    <div style={{...S.modal,maxHeight:"85vh",overflowY:"auto",WebkitOverflowScrolling:"touch",background:getDarkColor("#FEF5EC","#16213E"),color:getDarkColor("#3D2B1A","#E8E8E8"),position:"relative"}} onClick={e=>e.stopPropagation()}>
+      <ModalHeader title="Gerenciar Categorias" icon="📝" onClose={onClose}/>
       <div style={S.tTog}>
         {["expense","income"].map(t=><button key={t} style={{...S.tBtn,...(type===t?(t==="expense"?S.tExp:S.tInc):{})}} onClick={()=>setType(t)}>{t==="expense"?"💸 Despesa":"💰 Receita"}</button>)}
       </div>
@@ -802,16 +870,7 @@ function AddModal({onSave,onClose,customCats,onOpenCatModal}){
 
   return<div style={S.ov} onClick={onClose}>
     <div style={{...S.modal,maxHeight:"85vh",overflowY:"auto",WebkitOverflowScrolling:"touch",position:"relative"}} onClick={e=>e.stopPropagation()}>
-      {/* Drag handle */}
-      <div onClick={onClose} style={{width:"100%",display:"flex",justifyContent:"center",padding:"2px 0 10px",cursor:"pointer",marginTop:-8}}>
-        <div style={{width:44,height:5,borderRadius:3,background:"#D4B9A3"}}/>
-      </div>
-      {/* Top bar with Back + Close */}
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
-        <button onClick={onClose} style={{display:"flex",alignItems:"center",gap:4,background:"none",border:"none",color:"#9A7B6A",fontSize:14,cursor:"pointer",padding:"6px 8px",fontFamily:"inherit"}}>← Voltar</button>
-        <button onClick={onClose} aria-label="Fechar" style={{width:34,height:34,borderRadius:"50%",border:"none",background:"#F0E4D8",color:"#3D2B1A",fontSize:18,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"inherit"}}>✕</button>
-      </div>
-      <div style={S.mTitle}>Novo Movimento</div>
+      <ModalHeader title="Novo Movimento" onClose={onClose}/>
 
       {/* Receipt Scanner Button */}
       <div style={{marginBottom:14}}>
@@ -877,8 +936,8 @@ function AddModal({onSave,onClose,customCats,onOpenCatModal}){
 // ============ DETAIL MODAL ============
 function DetailModal({tx,onDelete,onClose}){
   return<div style={S.ov} onClick={onClose}>
-    <div style={S.modal} onClick={e=>e.stopPropagation()}>
-      <div style={S.mTitle}>Detalhe</div>
+    <div style={{...S.modal,position:"relative"}} onClick={e=>e.stopPropagation()}>
+      <ModalHeader title="Detalhe" onClose={onClose}/>
       {tx.photo&&<img src={tx.photo} alt="recibo" style={{width:"100%",maxHeight:170,objectFit:"cover",borderRadius:12,marginBottom:14}}/>}
       <div style={S.dGrid}>
         <span style={S.dL}>Tipo</span><span style={{color:tx.type==="income"?"#4A7D6E":"#C45A32",fontWeight:700}}>{tx.type==="income"?"Receita":"Despesa"}</span>
@@ -901,8 +960,8 @@ function DetailModal({tx,onDelete,onClose}){
 function BudgetModal({month,ml,budgets,onSave,onClose}){
   const[vals,setVals]=useState(()=>{const o={};ECATS.forEach(c=>{o[c.id]=budgets[`${month}:${c.id}`]||"";});return o;});
   return<div style={S.ov} onClick={onClose}>
-    <div style={{...S.modal,maxHeight:"85vh",overflowY:"auto",WebkitOverflowScrolling:"touch"}} onClick={e=>e.stopPropagation()}>
-      <div style={S.mTitle}>🎯 Orçamentos — {ml}</div>
+    <div style={{...S.modal,maxHeight:"85vh",overflowY:"auto",WebkitOverflowScrolling:"touch",position:"relative"}} onClick={e=>e.stopPropagation()}>
+      <ModalHeader title={"Orçamentos — "+ml} icon="🎯" onClose={onClose}/>
       <p style={{fontSize:12,color:"#9A7B6A",textAlign:"center",marginBottom:14,marginTop:-10}}>Deixa vazio para sem limite</p>
       {ECATS.map(cat=><div key={cat.id} style={{marginBottom:10}}>
         <label style={S.fl}>{cat.l}</label>
@@ -922,8 +981,8 @@ function GoalModal({onSave,onClose}){
   const[emoji,setEmoji]=useState("🎯");
   const[color,setColor]=useState(CC[0]);
   return<div style={S.ov} onClick={onClose}>
-    <div style={S.modal} onClick={e=>e.stopPropagation()}>
-      <div style={S.mTitle}>🏦 Novo Objetivo</div>
+    <div style={{...S.modal,position:"relative",maxHeight:"88vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
+      <ModalHeader title="Novo Objetivo" icon="🏦" onClose={onClose}/>
       <div style={{display:"flex",flexWrap:"wrap",gap:7,marginBottom:14,maxHeight:170,overflowY:"auto",padding:6,background:"#FAF3EB",borderRadius:10,border:"1px solid #E0CEBE"}}>
         {GEMOJIS.map((e,i)=><button key={e+i} style={{width:38,height:38,fontSize:18,borderRadius:9,border:emoji===e?"2px solid #E07B54":"1.5px solid #E0CEBE",background:emoji===e?"#FEF5EC":"#fff",cursor:"pointer",flexShrink:0}} onClick={()=>setEmoji(e)}>{e}</button>)}
       </div>
@@ -950,8 +1009,8 @@ function RecurModal({onSave,onClose}){
   const[acc,setAcc]=useState(ACCS[0]);
   const[day,setDay]=useState(1);
   return<div style={S.ov} onClick={onClose}>
-    <div style={S.modal} onClick={e=>e.stopPropagation()}>
-      <div style={S.mTitle}>🔁 Nova Recorrente</div>
+    <div style={{...S.modal,position:"relative",maxHeight:"88vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
+      <ModalHeader title="Nova Recorrente" icon="🔁" onClose={onClose}/>
       <label style={S.fl}>Nome</label>
       <input style={S.inp} placeholder="ex: Renda, Netflix" value={name} onChange={e=>setName(e.target.value)}/>
       <label style={S.fl}>Valor (€)</label>
@@ -1015,12 +1074,19 @@ async function biometricAuth(){
   }catch{return false;}
 }
 
+const PIN_ATTEMPTS_KEY="fm_pin_attempts";
+const PIN_LOCKOUT_KEY="fm_pin_lockout";
+
 function LockScreen({onUnlock}){
   const[pin,setPin]=useState("");
   const[step,setStep]=useState(()=>localStorage.getItem(PIN_KEY)?"login":"setup");
   const[confirmPin,setConfirmPin]=useState("");
   const[error,setError]=useState("");
   const[bioAvail,setBioAvail]=useState(false);
+  const[lockoutLeft,setLockoutLeft]=useState(()=>{
+    const t=parseInt(localStorage.getItem(PIN_LOCKOUT_KEY)||"0");
+    return t>Date.now()?Math.ceil((t-Date.now())/1000):0;
+  });
   const hasBio=!!localStorage.getItem(BIOMETRIC_KEY);
 
   useEffect(()=>{
@@ -1031,12 +1097,25 @@ function LockScreen({onUnlock}){
       }
     })();
     // Auto-trigger biometric on login
-    if(step==="login"&&hasBio){
+    if(step==="login"&&hasBio&&lockoutLeft===0){
       biometricAuth().then(ok=>{if(ok)onUnlock();});
     }
   },[]);
 
+  // Lockout countdown
+  useEffect(()=>{
+    if(lockoutLeft<=0)return;
+    const t=setInterval(()=>{
+      setLockoutLeft(l=>{
+        if(l<=1){localStorage.removeItem(PIN_LOCKOUT_KEY);return 0;}
+        return l-1;
+      });
+    },1000);
+    return()=>clearInterval(t);
+  },[lockoutLeft]);
+
   const handleDigit=d=>{
+    if(lockoutLeft>0)return;
     if(pin.length>=4)return;
     const np=pin+d;
     setPin(np);setError("");
@@ -1045,14 +1124,30 @@ function LockScreen({onUnlock}){
       else if(step==="confirm"){
         if(np===confirmPin){
           localStorage.setItem(PIN_KEY,hashPin(np));
+          localStorage.removeItem(PIN_ATTEMPTS_KEY);
           // Offer biometric
           if(bioAvail){setStep("biometric");setPin("");}
           else onUnlock();
         }else{setError("PINs não coincidem. Tenta de novo.");setPin("");setStep("setup");setConfirmPin("");}
       }
       else if(step==="login"){
-        if(hashPin(np)===localStorage.getItem(PIN_KEY))onUnlock();
-        else{setError("PIN incorreto");setPin("");}
+        if(hashPin(np)===localStorage.getItem(PIN_KEY)){
+          localStorage.removeItem(PIN_ATTEMPTS_KEY);
+          onUnlock();
+        }
+        else{
+          const n=parseInt(localStorage.getItem(PIN_ATTEMPTS_KEY)||"0")+1;
+          localStorage.setItem(PIN_ATTEMPTS_KEY,String(n));
+          if(n>=5){
+            const until=Date.now()+60000;
+            localStorage.setItem(PIN_LOCKOUT_KEY,String(until));
+            setLockoutLeft(60);
+            setError("5 tentativas erradas. Bloqueado 60s.");
+          }else{
+            setError("PIN incorreto ("+n+"/5)");
+          }
+          setPin("");
+        }
       }
     }
   };
@@ -1110,10 +1205,11 @@ function LockScreen({onUnlock}){
       "Introduz o teu PIN"
     ),
     React.createElement("div",{style:{display:"flex",gap:14,marginBottom:8}},dots),
-    error&&React.createElement("div",{style:{fontSize:12,color:"#C45A32",marginBottom:8,height:18}},error),
-    !error&&React.createElement("div",{style:{height:26}}),
+    lockoutLeft>0?React.createElement("div",{style:{fontSize:13,color:"#C45A32",marginBottom:8,fontWeight:700,textAlign:"center"}},"🔒 Bloqueado por "+lockoutLeft+"s"):
+    error?React.createElement("div",{style:{fontSize:12,color:"#C45A32",marginBottom:8,height:18}},error):
+    React.createElement("div",{style:{height:26}}),
     React.createElement("div",{style:{
-      display:"grid",gridTemplateColumns:"repeat(3,68px)",gap:14,justifyContent:"center"
+      display:"grid",gridTemplateColumns:"repeat(3,68px)",gap:14,justifyContent:"center",opacity:lockoutLeft>0?0.35:1,pointerEvents:lockoutLeft>0?"none":"auto"
     }},numpad)
   );
 }
@@ -1140,6 +1236,9 @@ function App(){
   const[darkMode,setDarkMode]=useState(()=>localStorage.getItem("fm_dark_mode")==="1");
   const[customCats,setCustomCats]=useState(()=>{try{const d=localStorage.getItem("fm_custom_cats");return d?JSON.parse(d):{expense:[],income:[]};}catch{return{expense:[],income:[]};}});
   const[catModalOpen,setCatModalOpen]=useState(false);
+  const[lastSyncAt,setLastSyncAt]=useState(()=>parseInt(localStorage.getItem("fm_last_sync")||"0")||0);
+  const[txSearch,setTxSearch]=useState("");
+  const[online,setOnline]=useState(()=>typeof navigator!=="undefined"?navigator.onLine:true);
   const lastSave=useRef(0),pollRef=useRef(null);
 
   // Load data
@@ -1189,9 +1288,20 @@ function App(){
   // Push to sync on state change
   useEffect(()=>{
     if(!state||!syncId)return;
-    const t=setTimeout(()=>syncWrite(state),2000);
+    const t=setTimeout(async()=>{
+      const ok=await syncWrite(state);
+      if(ok)setLastSyncAt(Date.now());
+    },2000);
     return()=>clearTimeout(t);
   },[state,syncId]);
+
+  // Online/offline listeners
+  useEffect(()=>{
+    const on=()=>setOnline(true),off=()=>setOnline(false);
+    window.addEventListener("online",on);
+    window.addEventListener("offline",off);
+    return()=>{window.removeEventListener("online",on);window.removeEventListener("offline",off);};
+  },[]);
 
   // Notification timer
   useEffect(()=>{
@@ -1260,6 +1370,25 @@ function App(){
     toast$(darkMode?"Modo claro ativado":"Modo escuro ativado");
   },[darkMode,toast$]);
 
+  const handleExport=useCallback(()=>{
+    if(!state)return;
+    const payload={version:APP_VERSION,exportedAt:new Date().toISOString(),state,customCats};
+    downloadJSON(payload,"familia-martinho-"+tod()+".json");
+    toast$("Backup exportado");
+  },[state,customCats,toast$]);
+
+  const handleImport=useCallback(async(file)=>{
+    try{
+      const data=await readJSONFile(file);
+      if(!data||!data.state||!data.state.transactions)throw new Error("Ficheiro inválido");
+      if(!confirm("Restaurar este backup? Os dados atuais serão substituídos."))return;
+      setState(data.state);
+      if(data.customCats)setCustomCats(data.customCats);
+      toast$("Backup restaurado");
+      setSettingsOpen(false);
+    }catch(e){toast$("Erro: "+e.message,true);}
+  },[toast$]);
+
   const addCustomCat=useCallback((type,emoji,name)=>{
     setCustomCats(prev=>({
       ...prev,
@@ -1319,6 +1448,7 @@ function App(){
           <button style={S.addBtn} onClick={()=>setAddOpen(true)}>＋</button>
         </div>
       </div>
+      {!online&&<div style={{background:"#FFF4E0",borderBottom:"1px solid #E8A44A",padding:"6px 16px",fontSize:12,color:"#8A6B2E",textAlign:"center",fontWeight:700}}>📡 Sem ligação — dados guardados localmente</div>}
       {syncId&&<div style={S.shBanner}>🔗 Sincronizado — dados partilhados com o outro telemóvel</div>}
       {(alerts.length>0||pendingRecur.length>0)&&<div style={{padding:"8px 12px 0"}}>
         {pendingRecur.length>0&&<div style={{...S.alert,background:"#F0F4FF",borderLeftColor:"#5B8FC9"}}>
@@ -1425,12 +1555,19 @@ function App(){
         </>}
 
         {tab==="txs"&&<>
-          <div style={{display:"flex",gap:7,marginBottom:12}}>
+          <div style={{display:"flex",gap:7,marginBottom:10}}>
             <button style={S.expBtn} onClick={()=>{exportCSV(state.transactions,fMonth);toast$("CSV exportado");}}>📥 CSV</button>
             <button style={{...S.expBtn,borderColor:"#5B8FC9",color:"#5B8FC9"}} onClick={()=>printReport(state,fMonth)}>📄 PDF</button>
           </div>
-          {vis.length===0&&<div style={S.empty}><div style={{fontSize:40}}>📋</div><p>Sem movimentos.</p></div>}
-          {[...vis].sort((a,b)=>b.date.localeCompare(a.date)).map(tx=>(
+          <div style={{position:"relative",marginBottom:12}}>
+            <input value={txSearch} onChange={e=>setTxSearch(e.target.value)} placeholder="🔍 Procurar por descrição, categoria, valor..." style={{...S.inp,marginBottom:0,paddingRight:txSearch?36:12}}/>
+            {txSearch&&<button onClick={()=>setTxSearch("")} style={{position:"absolute",right:8,top:"50%",transform:"translateY(-50%)",background:"none",border:"none",fontSize:16,cursor:"pointer",color:"#9A7B6A"}}>✕</button>}
+          </div>
+          {(()=>{
+            const q=txSearch.trim().toLowerCase();
+            const filtered=q?vis.filter(t=>(t.description||"").toLowerCase().includes(q)||(ALLCATS[t.category]||t.category||"").toLowerCase().includes(q)||String(t.amount).includes(q)||(t.user||"").toLowerCase().includes(q)||(t.account||"").toLowerCase().includes(q)):vis;
+            if(filtered.length===0)return <div style={S.empty}><div style={{fontSize:40}}>{q?"🔍":"📋"}</div><p>{q?"Nenhum movimento encontrado.":"Sem movimentos."}</p></div>;
+            return [...filtered].sort((a,b)=>b.date.localeCompare(a.date)).map(tx=>(
             <div key={tx.id} style={S.txRow} onClick={()=>setDetailTx(tx)}>
               <div style={{...S.txIco,background:tx.type==="income"?"#E8F4F0":"#FAEEE8",overflow:"hidden"}}>
                 {tx.photo?<img src={tx.photo} style={{width:"100%",height:"100%",objectFit:"cover",borderRadius:12}} alt=""/>:ALLCATS[tx.category]?.slice(0,2)||"📦"}
@@ -1441,7 +1578,8 @@ function App(){
               </div>
               <div style={{...S.txA,color:tx.type==="income"?"#4A7D6E":"#C45A32"}}>{tx.type==="income"?"+":"-"}{fmt(tx.amount)}</div>
             </div>
-          ))}
+          ));
+          })()}
         </>}
 
         {tab==="goals"&&<>
@@ -1513,7 +1651,7 @@ function App(){
       {goalOpen&&<GoalModal onSave={addGoal} onClose={()=>setGoalOpen(false)}/>}
       {recurOpen&&<RecurModal onSave={saveRecur} onClose={()=>setRecurOpen(false)}/>}
       {syncOpen&&<SyncModal syncId={syncId} onSync={handleSyncCreate} onJoin={handleSyncJoin} onDisconnect={handleSyncDisconnect} onClose={()=>setSyncOpen(false)}/>}
-      {settingsOpen&&<SettingsModal notifsEnabled={notifsEnabled} onToggleNotifs={handleToggleNotifs} onOpenSync={()=>{setSettingsOpen(false);setSyncOpen(true);}} onOpenCatModal={()=>{setSettingsOpen(false);setCatModalOpen(true);}} darkMode={darkMode} onToggleDarkMode={handleToggleDarkMode} onClose={()=>setSettingsOpen(false)}/>}
+      {settingsOpen&&<SettingsModal notifsEnabled={notifsEnabled} onToggleNotifs={handleToggleNotifs} onOpenSync={()=>{setSettingsOpen(false);setSyncOpen(true);}} onOpenCatModal={()=>{setSettingsOpen(false);setCatModalOpen(true);}} darkMode={darkMode} onToggleDarkMode={handleToggleDarkMode} onClose={()=>setSettingsOpen(false)} onExport={handleExport} onImport={handleImport} lastSyncAt={lastSyncAt} syncId={syncId}/>}
       {catModalOpen&&<CategoryModal customCats={customCats} onAddCat={addCustomCat} onDelCat={delCustomCat} darkMode={darkMode} onClose={()=>setCatModalOpen(false)}/>}
     </div>
   );
@@ -1587,8 +1725,22 @@ const S={
 };
 
 // ============ RENDER ============
+const AUTO_LOCK_MS=3*60*1000; // 3 min
 function Root(){
   const[unlocked,setUnlocked]=useState(false);
+  const hiddenAt=useRef(0);
+  useEffect(()=>{
+    if(!unlocked)return;
+    const onVis=()=>{
+      if(document.hidden){hiddenAt.current=Date.now();}
+      else if(hiddenAt.current&&Date.now()-hiddenAt.current>AUTO_LOCK_MS){
+        // Only lock if a PIN exists
+        if(localStorage.getItem(PIN_KEY))setUnlocked(false);
+      }
+    };
+    document.addEventListener("visibilitychange",onVis);
+    return()=>document.removeEventListener("visibilitychange",onVis);
+  },[unlocked]);
   if(!unlocked)return React.createElement(LockScreen,{onUnlock:()=>setUnlocked(true)});
   return React.createElement(App);
 }

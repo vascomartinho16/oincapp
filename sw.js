@@ -1,4 +1,4 @@
-const CACHE_NAME = 'familia-martinho-v10';
+const CACHE_NAME = 'familia-martinho-v11';
 const ASSETS = [
   '/',
   '/index.html',
