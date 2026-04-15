@@ -30,7 +30,7 @@ input,select,textarea{font-size:16px!important}
 <script type="text/babel" data-type="module">
 const{useState,useEffect,useCallback,useRef}=React;
 
-const APP_VERSION="12";
+const APP_VERSION="13";
 
 /* ============ SHARED MODAL HEADER ============ */
 function ModalHeader({title,onClose,icon}){
@@ -1422,6 +1422,36 @@ function App(){
       return{...s,transactions:[...news,...s.transactions]};
     });
   },[fMonth,toast$]);
+  const applyRecurringYear=useCallback((mode="all")=>{
+    // mode: "all" = todos os 12 meses; "past" = só até ao mês atual
+    const year=parseInt(fMonth.slice(0,4));
+    const nowMonth=new Date().getMonth();
+    const nowYear=new Date().getFullYear();
+    const active=(state?.recurring||[]).filter(r=>r.active);
+    if(!active.length){toast$("Não há recorrentes ativos","warn");return;}
+    const limit=mode==="past"?(year===nowYear?nowMonth:11):11;
+    const monthsToDo=[];
+    for(let m=0;m<=limit;m++)monthsToDo.push(`${year}-${String(m+1).padStart(2,"0")}`);
+    if(!confirm(`Aplicar ${active.length} recorrente(s) aos ${monthsToDo.length} meses de ${year}?\n\nOs meses que já têm o recorrente não são duplicados.`))return;
+    setState(s=>{
+      let added=0;
+      const newTxs=[];
+      monthsToDo.forEach(month=>{
+        const existing=new Set(s.transactions.filter(t=>gm(t.date)===month&&t.recurring_id).map(t=>t.recurring_id));
+        active.forEach(r=>{
+          if(existing.has(r.id))return;
+          // Clamp day to last day of month
+          const lastDay=new Date(parseInt(month.slice(0,4)),parseInt(month.slice(5,7)),0).getDate();
+          const day=Math.min(Math.max(r.day||1,1),lastDay);
+          newTxs.push({...r,id:uid(),recurring_id:r.id,type:"expense",date:`${month}-${String(day).padStart(2,"0")}`});
+          added++;
+        });
+      });
+      if(!added){toast$("Já estavam todos aplicados","warn");return s;}
+      toast$(`${added} movimento(s) criado(s) em ${year}`);
+      return{...s,transactions:[...newTxs,...s.transactions]};
+    });
+  },[fMonth,state,toast$]);
 
   const handleToggleNotifs=useCallback(()=>{
     if(!notifsEnabled){
@@ -1685,7 +1715,11 @@ function App(){
               <div style={{fontSize:14,fontWeight:700,color:"#C45A32",marginRight:8}}>{fmt(r.amount)}</div>
               <button style={{background:"none",border:"none",cursor:"pointer",fontSize:15,color:"#9A7B6A",padding:"4px"}} onClick={()=>delRecur(r.id)}>✕</button>
             </div>)}
-            {(state.recurring||[]).length>0&&<button style={{...S.expBtn,marginTop:10,borderColor:"#B07CC6",color:"#B07CC6"}} onClick={applyRecurring}>🔁 Aplicar a {ml}</button>}
+            {(state.recurring||[]).length>0&&<div style={{display:"flex",gap:7,flexWrap:"wrap",marginTop:10}}>
+              <button style={{...S.expBtn,borderColor:"#B07CC6",color:"#B07CC6"}} onClick={applyRecurring}>🔁 Só {ml}</button>
+              <button style={{...S.expBtn,borderColor:"#5B8FC9",color:"#5B8FC9"}} onClick={()=>applyRecurringYear("past")}>📅 Até hoje ({fMonth.slice(0,4)})</button>
+              <button style={{...S.expBtn,borderColor:"#4A7D6E",color:"#4A7D6E"}} onClick={()=>applyRecurringYear("all")}>🗓️ Ano todo ({fMonth.slice(0,4)})</button>
+            </div>}
           </div>
           {monthTxs.length===0&&<div style={S.empty}>
             <div style={{fontSize:52,marginBottom:6}}>🐷</div>
