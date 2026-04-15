@@ -30,7 +30,7 @@ input,select,textarea{font-size:16px!important}
 <script type="text/babel" data-type="module">
 const{useState,useEffect,useCallback,useRef}=React;
 
-const APP_VERSION="11";
+const APP_VERSION="12";
 
 /* ============ SHARED MODAL HEADER ============ */
 function ModalHeader({title,onClose,icon}){
@@ -130,8 +130,12 @@ const ECATS=[
 ];
 const ICATS=[{id:"salary",l:"💼 Salário"},{id:"freelance",l:"🛠️ Freelance"},{id:"invest",l:"📈 Investimentos"},{id:"gift",l:"🎁 Oferta"},{id:"other",l:"📦 Outro"}];
 const ALLCATS=Object.fromEntries([...ECATS,...ICATS].map(c=>[c.id,c.l]));
+ALLCATS.transfer="🔄 Transferência";
+ALLCATS.reimbursed="💵 Reembolso";
 const tod=()=>new Date().toISOString().split("T")[0];
 const gm=d=>d?.slice(0,7);
+// Transfers and reimbursement pairs don't count as real income/expense
+const countable=t=>t.category!=="transfer"&&t.category!=="reimbursed"&&!t.reimbursed;
 const fmt=v=>new Intl.NumberFormat("pt-PT",{style:"currency",currency:"EUR"}).format(v||0);
 const uid=()=>Date.now()+Math.random().toString(36).slice(2);
 
@@ -237,19 +241,39 @@ function readJSONFile(file){
   });
 }
 
-// ============ SYNC via jsonblob.com ============
+// ============ SYNC com E2E Encryption (AES-GCM 256) ============
 const SYNC_ID_KEY="fm_sync_id";
 const SYNC_TS_KEY="fm_sync_ts";
 
-// Holds last error for debug display
 let LAST_SYNC_ERR="";
 
-// === jsonblob.com ===
-async function jsonblobCreate(data){
-  const res=await fetch("https://jsonblob.com/api/jsonBlob",{
-    method:"POST",headers:{"Content-Type":"application/json","Accept":"application/json"},
-    body:JSON.stringify({ts:Date.now(),data})
-  });
+// --- Base64url helpers ---
+function b64enc(buf){const a=new Uint8Array(buf);let s="";for(let i=0;i<a.length;i++)s+=String.fromCharCode(a[i]);return btoa(s).replace(/=/g,"").replace(/\+/g,"-").replace(/\//g,"_");}
+function b64dec(s){s=s.replace(/-/g,"+").replace(/_/g,"/");while(s.length%4)s+="=";const str=atob(s);const a=new Uint8Array(str.length);for(let i=0;i<str.length;i++)a[i]=str.charCodeAt(i);return a.buffer;}
+
+// --- Crypto helpers ---
+async function genSyncKey(){
+  const k=await crypto.subtle.generateKey({name:"AES-GCM",length:256},true,["encrypt","decrypt"]);
+  return b64enc(await crypto.subtle.exportKey("raw",k));
+}
+async function importSyncKey(b64){return crypto.subtle.importKey("raw",b64dec(b64),{name:"AES-GCM"},false,["encrypt","decrypt"]);}
+async function encryptPayload(obj,keyB64){
+  const key=await importSyncKey(keyB64);
+  const iv=crypto.getRandomValues(new Uint8Array(12));
+  const data=new TextEncoder().encode(JSON.stringify(obj));
+  const ct=await crypto.subtle.encrypt({name:"AES-GCM",iv},key,data);
+  return{enc:"v1",iv:b64enc(iv),ct:b64enc(ct)};
+}
+async function decryptPayload(obj,keyB64){
+  const key=await importSyncKey(keyB64);
+  const pt=await crypto.subtle.decrypt({name:"AES-GCM",iv:b64dec(obj.iv)},key,b64dec(obj.ct));
+  return JSON.parse(new TextDecoder().decode(pt));
+}
+function splitSyncId(full){const i=(full||"").indexOf("#");return i<0?{id:full||"",key:null}:{id:full.slice(0,i),key:full.slice(i+1)};}
+
+// === Backend creators (receive final body object) ===
+async function jsonblobCreate(body){
+  const res=await fetch("https://jsonblob.com/api/jsonBlob",{method:"POST",headers:{"Content-Type":"application/json","Accept":"application/json"},body:JSON.stringify(body)});
   if(!res.ok)throw new Error("jsonblob HTTP "+res.status);
   let id=null;
   for(const[k,v]of res.headers.entries()){if(k.toLowerCase()==="location"){id=v.split("/").pop();break;}}
@@ -257,31 +281,19 @@ async function jsonblobCreate(data){
   if(!id)throw new Error("jsonblob: Location header bloqueado por CORS");
   return "JB:"+id;
 }
-
-// === npoint.io === (POST to base creates bin, returns {id, ...})
-async function npointCreate(data){
-  const res=await fetch("https://api.npoint.io",{
-    method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({ts:Date.now(),data})
-  });
+async function npointCreate(body){
+  const res=await fetch("https://api.npoint.io",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   if(!res.ok)throw new Error("npoint HTTP "+res.status);
   const j=await res.json().catch(()=>null);
   if(!j||!j.id)throw new Error("npoint: resposta sem id");
   return "NP:"+j.id;
 }
-
-// === pantry-style fallback via firebase-like simple endpoint ===
-// We use ntfy.sh as plain HTTP relay (publishes JSON, retrieves last message)
-async function ntfyCreate(data){
-  // Generate a random topic name as the sync ID
+async function ntfyCreate(body){
   const chars="abcdefghjkmnpqrstuvwxyz23456789";
   let topic="oinc-";
   const rnd=crypto.getRandomValues(new Uint8Array(16));
   for(let i=0;i<16;i++)topic+=chars[rnd[i]%chars.length];
-  const body=JSON.stringify({ts:Date.now(),data});
-  const res=await fetch("https://ntfy.sh/"+topic,{
-    method:"POST",headers:{"Content-Type":"text/plain"},body
-  });
+  const res=await fetch("https://ntfy.sh/"+topic,{method:"POST",headers:{"Content-Type":"text/plain"},body:JSON.stringify(body)});
   if(!res.ok)throw new Error("ntfy HTTP "+res.status);
   return "NT:"+topic;
 }
@@ -289,9 +301,16 @@ async function ntfyCreate(data){
 async function syncCreate(data){
   LAST_SYNC_ERR="";
   const errs=[];
+  const keyB64=await genSyncKey();
+  const enc=await encryptPayload(data,keyB64);
+  const body={ts:Date.now(),...enc};
   for(const fn of [jsonblobCreate,npointCreate,ntfyCreate]){
-    try{const id=await fn(data);localStorage.setItem(SYNC_ID_KEY,id);return id;}
-    catch(e){console.warn(fn.name,"failed:",e);errs.push(fn.name+": "+e.message);}
+    try{
+      const id=await fn(body);
+      const full=id+"#"+keyB64;
+      localStorage.setItem(SYNC_ID_KEY,full);
+      return full;
+    }catch(e){console.warn(fn.name,"failed:",e);errs.push(fn.name+": "+e.message);}
   }
   LAST_SYNC_ERR=errs.join(" | ");
   return null;
@@ -301,38 +320,54 @@ function syncUrl(id){
   if(id.startsWith("JB:"))return{url:"https://jsonblob.com/api/jsonBlob/"+id.slice(3),isNtfy:false};
   if(id.startsWith("NP:"))return{url:"https://api.npoint.io/"+id.slice(3),isNtfy:false};
   if(id.startsWith("NT:"))return{url:"https://ntfy.sh/"+id.slice(3)+"/json?poll=1&since=all",isNtfy:true};
-  return{url:"https://jsonblob.com/api/jsonBlob/"+id,isNtfy:false}; // legacy
+  return{url:"https://jsonblob.com/api/jsonBlob/"+id,isNtfy:false};
 }
 
 async function syncRead(){
-  const id=localStorage.getItem(SYNC_ID_KEY);
-  if(!id)return null;
+  const full=localStorage.getItem(SYNC_ID_KEY);
+  if(!full)return null;
+  const{id,key}=splitSyncId(full);
   try{
     const{url,isNtfy}=syncUrl(id);
     const res=await fetch(url,{headers:{"Accept":"application/json"}});
     if(!res.ok)return null;
+    let body;
     if(isNtfy){
-      // ntfy returns NDJSON; pick last message
       const text=await res.text();
       const lines=text.trim().split("\n").filter(Boolean);
       if(!lines.length)return null;
       const last=JSON.parse(lines[lines.length-1]);
-      return JSON.parse(last.message);
+      body=JSON.parse(last.message);
+    }else{
+      body=await res.json();
     }
-    return await res.json();
+    if(body&&body.enc==="v1"){
+      if(!key)return null; // encrypted but no local key
+      try{const data=await decryptPayload(body,key);return{ts:body.ts,data};}
+      catch(e){console.error("decrypt failed:",e);return null;}
+    }
+    return body; // legacy unencrypted
   }catch{return null;}
 }
 
 async function syncWrite(data){
-  const id=localStorage.getItem(SYNC_ID_KEY);
-  if(!id)return false;
+  const full=localStorage.getItem(SYNC_ID_KEY);
+  if(!full)return false;
+  const{id,key}=splitSyncId(full);
   try{
-    const body=JSON.stringify({ts:Date.now(),data});
+    let body;
+    if(key){
+      const enc=await encryptPayload(data,key);
+      body={ts:Date.now(),...enc};
+    }else{
+      body={ts:Date.now(),data};
+    }
+    const bodyStr=JSON.stringify(body);
     if(id.startsWith("NT:")){
-      await fetch("https://ntfy.sh/"+id.slice(3),{method:"POST",headers:{"Content-Type":"text/plain"},body});
+      await fetch("https://ntfy.sh/"+id.slice(3),{method:"POST",headers:{"Content-Type":"text/plain"},body:bodyStr});
     }else{
       const{url}=syncUrl(id);
-      await fetch(url,{method:"PUT",headers:{"Content-Type":"application/json","Accept":"application/json"},body});
+      await fetch(url,{method:"PUT",headers:{"Content-Type":"application/json","Accept":"application/json"},body:bodyStr});
     }
     localStorage.setItem("fm_last_sync",String(Date.now()));
     return true;
@@ -696,12 +731,13 @@ function SyncModal({syncId,onSync,onJoin,onDisconnect,onClose}){
         </div>
         <p style={{fontSize:12,color:"#9A7B6A",marginBottom:14,lineHeight:1.6,textAlign:"center"}}>Envia este código à Sara por WhatsApp. Ela cola em "Juntar sincronização" e pronto — dados partilhados!</p>
         <div style={{background:"#E8F4F0",borderRadius:10,padding:"10px 14px",marginBottom:14}}>
-          <div style={{fontSize:11,color:"#4A7D6E",fontWeight:700}}>✅ Sincronização ativa</div>
-          <div style={{fontSize:11,color:"#6B9E8E",marginTop:3}}>Os dados são sincronizados automaticamente a cada 15 segundos.</div>
+          <div style={{fontSize:11,color:"#4A7D6E",fontWeight:700}}>✅ Sincronização ativa {syncId.includes("#")&&"· 🔒 Cifrado E2E"}</div>
+          <div style={{fontSize:11,color:"#6B9E8E",marginTop:3}}>{syncId.includes("#")?"Dados cifrados com AES-256. Só quem tem o código consegue abrir.":"Os dados são sincronizados a cada 15s (modo antigo, sem cifra — cria uma nova para ativar)."}</div>
         </div>
         <button style={{...S.delBtn}} onClick={()=>{if(confirm("Desligar sincronização?")){onDisconnect();}}}>🔌 Desligar sincronização</button>
       </div>:<div>
-        <p style={{fontSize:13,color:"#3D2B1A",marginBottom:16,lineHeight:1.6,textAlign:"center"}}>Sincroniza os dados entre os telemóveis do Vasco e da Sara.</p>
+        <p style={{fontSize:13,color:"#3D2B1A",marginBottom:8,lineHeight:1.6,textAlign:"center"}}>Sincroniza os dados entre os telemóveis do Vasco e da Sara.</p>
+        <p style={{fontSize:11,color:"#4A7D6E",marginBottom:16,textAlign:"center",fontWeight:700}}>🔒 Cifrado end-to-end (AES-256)</p>
         <button style={{...S.saveBtn,marginBottom:14}} disabled={creating} onClick={async()=>{setCreating(true);await onSync();setCreating(false);}}>{creating?"⏳ A criar…":"🆕 Criar nova sincronização"}</button>
         <div style={{borderTop:"1px solid #E0CEBE",paddingTop:14}}>
           <label style={S.fl}>Ou juntar a uma existente:</label>
@@ -840,15 +876,26 @@ function AddModal({onSave,onClose,customCats,onOpenCatModal}){
   const[cat,setCat]=useState(ECATS[0].id);
   const[user,setUser]=useState(USERS[0]);
   const[acc,setAcc]=useState(ACCS[0]);
+  const[accTo,setAccTo]=useState(ACCS[1]);
   const[date,setDate]=useState(tod());
   const[desc,setDesc]=useState("");
   const[photo,setPhoto]=useState(null);
   const[split,setSplit]=useState(false);
+  const[reimbursable,setReimbursable]=useState(false);
   const[scanning,setScanning]=useState(false);
   const[scanMsg,setScanMsg]=useState("");
   const defaultCats=type==="expense"?ECATS:ICATS;
-  const cats=[...defaultCats,...(customCats[type]||[])];
-  const go=()=>{const a=parseFloat(String(amt).replace(",","."));if(!a||a<=0)return;onSave({type,amount:a,category:cat,user,account:acc,date,description:desc,photo,split});};
+  const cats=type==="transfer"?[]:[...defaultCats,...(customCats[type]||[])];
+  const go=()=>{
+    const a=parseFloat(String(amt).replace(",","."));
+    if(!a||a<=0)return;
+    if(type==="transfer"){
+      if(acc===accTo){alert("Escolhe contas diferentes para a transferência.");return;}
+      onSave({type:"transfer",amount:a,from:acc,to:accTo,user,date,description:desc||`${acc} → ${accTo}`});
+      return;
+    }
+    onSave({type,amount:a,category:cat,user,account:acc,date,description:desc,photo,split,reimbursable});
+  };
 
   const handleScan=async(file)=>{
     if(!file)return;
@@ -887,8 +934,8 @@ function AddModal({onSave,onClose,customCats,onOpenCatModal}){
 
       <div style={{height:1,background:"#F0E4D8",margin:"0 0 14px"}}/>
 
-      <div style={S.tTog}>
-        {["expense","income"].map(t=><button key={t} style={{...S.tBtn,...(type===t?(t==="expense"?S.tExp:S.tInc):{})}} onClick={()=>{setType(t);setCat((t==="expense"?ECATS:ICATS)[0].id);setSplit(false);}}>{t==="expense"?"💸 Despesa":"💰 Receita"}</button>)}
+      <div style={{display:"flex",gap:6,marginBottom:13}}>
+        {[{k:"expense",l:"💸 Despesa",s:S.tExp},{k:"income",l:"💰 Receita",s:S.tInc},{k:"transfer",l:"🔄 Transf.",s:{background:"#E8F0FF",borderColor:"#5B8FC9",color:"#3A6FA5"}}].map(t=><button key={t.k} style={{...S.tBtn,fontSize:12,padding:"9px 4px",...(type===t.k?t.s:{})}} onClick={()=>{setType(t.k);if(t.k!=="transfer")setCat((t.k==="expense"?ECATS:ICATS)[0].id);setSplit(false);setReimbursable(false);}}>{t.l}</button>)}
       </div>
       <label style={S.fl}>Valor (€)</label>
       <input style={{...S.inp,...(amt&&!isNaN(parseFloat(String(amt).replace(",",".")))?{borderColor:"#6B9E8E",background:"#F0FAF5"}:{})}} type="number" inputMode="decimal" placeholder="0,00" value={amt} onChange={e=>setAmt(e.target.value)} autoFocus/>
@@ -896,13 +943,20 @@ function AddModal({onSave,onClose,customCats,onOpenCatModal}){
       <div style={{display:"flex",gap:8,marginBottom:13}}>
         {USERS.map(u=><button key={u} style={{...S.tBtn,...(user===u?{background:UC[u],borderColor:UC[u],color:"#fff"}:{})}} onClick={()=>setUser(u)}>{u}</button>)}
       </div>
-      <label style={S.fl}>Conta</label>
-      <select style={S.sel} value={acc} onChange={e=>setAcc(e.target.value)}>{ACCS.map(a=><option key={a} value={a}>{a}</option>)}</select>
-      <label style={S.fl}>Categoria</label>
-      <div style={{display:"flex",gap:8,marginBottom:13}}>
-        <select style={{...S.sel,flex:1,marginBottom:0}} value={cat} onChange={e=>setCat(e.target.value)}>{cats.map(c=><option key={c.id} value={c.id}>{c.l}</option>)}</select>
-        <button style={{flex:"0 0 40px",padding:"10px",borderRadius:10,border:"1.5px solid #E0CEBE",background:"#fff",fontSize:16,cursor:"pointer",fontFamily:"inherit"}} onClick={onOpenCatModal} title="Gerenciar categorias">＋</button>
-      </div>
+      {type==="transfer"?<>
+        <label style={S.fl}>De (conta origem)</label>
+        <select style={S.sel} value={acc} onChange={e=>setAcc(e.target.value)}>{ACCS.map(a=><option key={a} value={a}>{a}</option>)}</select>
+        <label style={S.fl}>Para (conta destino)</label>
+        <select style={S.sel} value={accTo} onChange={e=>setAccTo(e.target.value)}>{ACCS.map(a=><option key={a} value={a}>{a}</option>)}</select>
+      </>:<>
+        <label style={S.fl}>Conta</label>
+        <select style={S.sel} value={acc} onChange={e=>setAcc(e.target.value)}>{ACCS.map(a=><option key={a} value={a}>{a}</option>)}</select>
+        <label style={S.fl}>Categoria</label>
+        <div style={{display:"flex",gap:8,marginBottom:13}}>
+          <select style={{...S.sel,flex:1,marginBottom:0}} value={cat} onChange={e=>setCat(e.target.value)}>{cats.map(c=><option key={c.id} value={c.id}>{c.l}</option>)}</select>
+          <button style={{flex:"0 0 40px",padding:"10px",borderRadius:10,border:"1.5px solid #E0CEBE",background:"#fff",fontSize:16,cursor:"pointer",fontFamily:"inherit"}} onClick={onOpenCatModal} title="Gerenciar categorias">＋</button>
+        </div>
+      </>}
       <label style={S.fl}>Data</label>
       <input style={S.inp} type="date" value={date} onChange={e=>setDate(e.target.value)}/>
       <label style={S.fl}>Nota (opcional)</label>
@@ -923,9 +977,13 @@ function AddModal({onSave,onClose,customCats,onOpenCatModal}){
           </div>
         </div>
       </div>}
-      {type==="expense"&&<label style={{display:"flex",alignItems:"center",marginBottom:14,cursor:"pointer"}}>
+      {type==="expense"&&<label style={{display:"flex",alignItems:"center",marginBottom:10,cursor:"pointer"}}>
         <input type="checkbox" checked={split} onChange={e=>setSplit(e.target.checked)} style={{marginRight:8,accentColor:"#B07CC6"}}/>
         <span style={{fontSize:13,color:"#3D2B1A"}}>🧾 Dividir 50/50 entre Vasco e Sara</span>
+      </label>}
+      {type==="expense"&&<label style={{display:"flex",alignItems:"center",marginBottom:14,cursor:"pointer"}}>
+        <input type="checkbox" checked={reimbursable} onChange={e=>setReimbursable(e.target.checked)} style={{marginRight:8,accentColor:"#E8A44A"}}/>
+        <span style={{fontSize:13,color:"#3D2B1A"}}>💵 Reembolsável (vou receber de volta)</span>
       </label>}
       <button style={S.saveBtn} onClick={go}>Guardar Movimento</button>
       <button style={S.closeBtn} onClick={onClose}>Cancelar</button>
@@ -934,22 +992,30 @@ function AddModal({onSave,onClose,customCats,onOpenCatModal}){
 }
 
 // ============ DETAIL MODAL ============
-function DetailModal({tx,onDelete,onClose}){
+function DetailModal({tx,onDelete,onClose,onReimburse}){
+  const isTransfer=tx.category==="transfer";
   return<div style={S.ov} onClick={onClose}>
     <div style={{...S.modal,position:"relative"}} onClick={e=>e.stopPropagation()}>
       <ModalHeader title="Detalhe" onClose={onClose}/>
       {tx.photo&&<img src={tx.photo} alt="recibo" style={{width:"100%",maxHeight:170,objectFit:"cover",borderRadius:12,marginBottom:14}}/>}
       <div style={S.dGrid}>
-        <span style={S.dL}>Tipo</span><span style={{color:tx.type==="income"?"#4A7D6E":"#C45A32",fontWeight:700}}>{tx.type==="income"?"Receita":"Despesa"}</span>
+        <span style={S.dL}>Tipo</span><span style={{color:isTransfer?"#5B8FC9":tx.type==="income"?"#4A7D6E":"#C45A32",fontWeight:700}}>{isTransfer?"🔄 Transferência":tx.type==="income"?"Receita":"Despesa"}</span>
         <span style={S.dL}>Valor</span><span style={{fontWeight:700,fontSize:17}}>{fmt(tx.amount)}</span>
         <span style={S.dL}>Data</span><span>{tx.date}</span>
         <span style={S.dL}>Pessoa</span><span style={{color:UC[tx.user]||"#999",fontWeight:700}}>{tx.user}</span>
-        <span style={S.dL}>Conta</span><span>{tx.account||"—"}</span>
-        <span style={S.dL}>Categoria</span><span>{ALLCATS[tx.category]||tx.category}</span>
+        {isTransfer?<>
+          <span style={S.dL}>{tx.transfer_side==="out"?"De":"Para"}</span><span>{tx.account}</span>
+          <span style={S.dL}>{tx.transfer_side==="out"?"Para":"De"}</span><span>{tx.transfer_peer||"—"}</span>
+        </>:<>
+          <span style={S.dL}>Conta</span><span>{tx.account||"—"}</span>
+          <span style={S.dL}>Categoria</span><span>{ALLCATS[tx.category]||tx.category}</span>
+        </>}
         {tx.description&&<><span style={S.dL}>Nota</span><span>{tx.description}</span></>}
         {tx.split&&<><span style={S.dL}>Split</span><span style={{color:"#B07CC6"}}>✓ 50/50</span></>}
+        {tx.reimbursable&&<><span style={S.dL}>Reembolso</span><span style={{color:tx.reimbursed?"#4A7D6E":"#E8A44A",fontWeight:700}}>{tx.reimbursed?"✅ Recebido":"⏳ Por receber"}</span></>}
         {tx.recurring_id&&<><span style={S.dL}>Tipo</span><span style={{color:"#5B8FC9"}}>🔁 Recorrente</span></>}
       </div>
+      {tx.reimbursable&&!tx.reimbursed&&tx.type==="expense"&&<button style={{...S.saveBtn,background:"linear-gradient(135deg,#E8A44A,#C4833A)"}} onClick={()=>{onReimburse(tx.id);onClose();}}>💵 Marcar como reembolsado</button>}
       <button style={S.delBtn} onClick={()=>onDelete(tx.id)}>🗑️ Eliminar</button>
       <button style={S.closeBtn} onClick={onClose}>Fechar</button>
     </div>
@@ -1313,8 +1379,32 @@ function App(){
 
   const toast$=useCallback((msg,warn=false)=>{setToast({msg,warn});setTimeout(()=>setToast(null),2800);},[]);
   const addTx=useCallback(tx=>{
-    setState(s=>{const txs=tx.split?[{...tx,id:uid(),user:USERS[0],amount:tx.amount/2,split:true},{...tx,id:uid(),user:USERS[1],amount:tx.amount/2,split:true}]:[{...tx,id:uid()}];return{...s,transactions:[...txs,...s.transactions]};});
-    setAddOpen(false);toast$(tx.split?"Split criado (2 movimentos)":"Guardado");
+    setState(s=>{
+      let txs;
+      if(tx.type==="transfer"){
+        const tid="tr_"+uid();
+        txs=[
+          {id:uid(),type:"expense",amount:tx.amount,category:"transfer",user:tx.user,account:tx.from,date:tx.date,description:tx.description,transfer_id:tid,transfer_side:"out",transfer_peer:tx.to},
+          {id:uid(),type:"income",amount:tx.amount,category:"transfer",user:tx.user,account:tx.to,date:tx.date,description:tx.description,transfer_id:tid,transfer_side:"in",transfer_peer:tx.from}
+        ];
+      }else if(tx.split){
+        txs=[{...tx,id:uid(),user:USERS[0],amount:tx.amount/2,split:true},{...tx,id:uid(),user:USERS[1],amount:tx.amount/2,split:true}];
+      }else{
+        txs=[{...tx,id:uid()}];
+      }
+      return{...s,transactions:[...txs,...s.transactions]};
+    });
+    setAddOpen(false);
+    toast$(tx.type==="transfer"?"Transferência registada":tx.split?"Split criado (2 movimentos)":"Guardado");
+  },[toast$]);
+  const markReimbursed=useCallback(id=>{
+    setState(s=>{
+      const tx=s.transactions.find(t=>t.id===id);
+      if(!tx)return s;
+      const reimbursement={id:uid(),type:"income",amount:tx.amount,category:"reimbursed",user:tx.user,account:tx.account,date:tod(),description:"Reembolso: "+(tx.description||ALLCATS[tx.category]||tx.category),reimburses:id};
+      return{...s,transactions:[reimbursement,...s.transactions.map(t=>t.id===id?{...t,reimbursed:true}:t)]};
+    });
+    toast$("Marcado como reembolsado");
   },[toast$]);
   const delTx=useCallback(id=>{setState(s=>({...s,transactions:s.transactions.filter(t=>t.id!==id)}));setDetailTx(null);toast$("Eliminado","warn");},[toast$]);
   const saveBdg=useCallback((cat,amt)=>setState(s=>({...s,budgets:{...s.budgets,[`${fMonth}:${cat}`]:amt}})),[fMonth]);
@@ -1413,20 +1503,27 @@ function App(){
 
   const monthTxs=state.transactions.filter(t=>gm(t.date)===fMonth);
   const vis=fUser==="Todos"?monthTxs:monthTxs.filter(t=>t.user===fUser);
-  const inc=vis.filter(t=>t.type==="income").reduce((s,t)=>s+t.amount,0);
-  const exp=vis.filter(t=>t.type==="expense").reduce((s,t)=>s+t.amount,0);
+  const inc=vis.filter(t=>t.type==="income"&&countable(t)).reduce((s,t)=>s+t.amount,0);
+  const exp=vis.filter(t=>t.type==="expense"&&countable(t)).reduce((s,t)=>s+t.amount,0);
   const bal=inc-exp;
-  const expByCat={};vis.filter(t=>t.type==="expense").forEach(t=>{expByCat[t.category]=(expByCat[t.category]||0)+t.amount;});
-  const expByUser=USERS.map(u=>({name:u,value:monthTxs.filter(t=>t.type==="expense"&&t.user===u).reduce((s,t)=>s+t.amount,0)})).filter(u=>u.value>0);
-  const expByAcc=ACCS.map(a=>({name:a,value:monthTxs.filter(t=>t.type==="expense"&&t.account===a).reduce((s,t)=>s+t.amount,0)})).filter(a=>a.value>0);
+  const savingsRate=inc>0?Math.round((bal/inc)*100):0;
+  const expByCat={};vis.filter(t=>t.type==="expense"&&countable(t)).forEach(t=>{expByCat[t.category]=(expByCat[t.category]||0)+t.amount;});
+  const expByUser=USERS.map(u=>({name:u,value:monthTxs.filter(t=>t.type==="expense"&&t.user===u&&countable(t)).reduce((s,t)=>s+t.amount,0)})).filter(u=>u.value>0);
+  const expByAcc=ACCS.map(a=>({name:a,value:monthTxs.filter(t=>t.type==="expense"&&t.account===a&&countable(t)).reduce((s,t)=>s+t.amount,0)})).filter(a=>a.value>0);
   const alerts=ECATS.map(cat=>{const b=state.budgets[`${fMonth}:${cat.id}`]||0,sp=expByCat[cat.id]||0;if(!b)return null;const p=sp/b;if(p>=1)return{cat,type:"over",msg:`${cat.l} — limite excedido! (${fmt(sp)} / ${fmt(b)})`};if(p>=0.8)return{cat,type:"warn",msg:`${cat.l} — ${Math.round(p*100)}% do limite`};return null;}).filter(Boolean);
   const cmpTxs=state.transactions.filter(t=>gm(t.date)===cmpMonth);
-  const cmpExp=cmpTxs.filter(t=>t.type==="expense").reduce((s,t)=>s+t.amount,0);
-  const cmpInc=cmpTxs.filter(t=>t.type==="income").reduce((s,t)=>s+t.amount,0);
+  const cmpExp=cmpTxs.filter(t=>t.type==="expense"&&countable(t)).reduce((s,t)=>s+t.amount,0);
+  const cmpInc=cmpTxs.filter(t=>t.type==="income"&&countable(t)).reduce((s,t)=>s+t.amount,0);
   const now=new Date();
-  const barData=Array.from({length:6},(_,i)=>{const d=new Date(now.getFullYear(),now.getMonth()-5+i,1);const m=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`;const t=state.transactions.filter(x=>gm(x.date)===m);return{name:MNS[d.getMonth()],R:t.filter(x=>x.type==="income").reduce((s,x)=>s+x.amount,0),D:t.filter(x=>x.type==="expense").reduce((s,x)=>s+x.amount,0)};});
+  const barData=Array.from({length:6},(_,i)=>{const d=new Date(now.getFullYear(),now.getMonth()-5+i,1);const m=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`;const t=state.transactions.filter(x=>gm(x.date)===m);return{name:MNS[d.getMonth()],R:t.filter(x=>x.type==="income"&&countable(x)).reduce((s,x)=>s+x.amount,0),D:t.filter(x=>x.type==="expense"&&countable(x)).reduce((s,x)=>s+x.amount,0)};});
   // Trend data: balance by month (last 6 months)
-  const trendData=Array.from({length:6},(_,i)=>{const d=new Date(now.getFullYear(),now.getMonth()-5+i,1);const m=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`;const t=state.transactions.filter(x=>gm(x.date)===m);const mInc=t.filter(x=>x.type==="income").reduce((s,x)=>s+x.amount,0);const mExp=t.filter(x=>x.type==="expense").reduce((s,x)=>s+x.amount,0);return{name:MNS[d.getMonth()],saldo:mInc-mExp,despesas:mExp};});
+  const trendData=Array.from({length:6},(_,i)=>{const d=new Date(now.getFullYear(),now.getMonth()-5+i,1);const m=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`;const t=state.transactions.filter(x=>gm(x.date)===m);const mInc=t.filter(x=>x.type==="income"&&countable(x)).reduce((s,x)=>s+x.amount,0);const mExp=t.filter(x=>x.type==="expense"&&countable(x)).reduce((s,x)=>s+x.amount,0);return{name:MNS[d.getMonth()],saldo:mInc-mExp,despesas:mExp};});
+  // Annual view: 12 months of current year
+  const curYear=parseInt(fMonth.slice(0,4));
+  const annualData=Array.from({length:12},(_,i)=>{const m=`${curYear}-${String(i+1).padStart(2,"0")}`;const t=state.transactions.filter(x=>gm(x.date)===m);const mInc=t.filter(x=>x.type==="income"&&countable(x)).reduce((s,x)=>s+x.amount,0);const mExp=t.filter(x=>x.type==="expense"&&countable(x)).reduce((s,x)=>s+x.amount,0);return{name:MNS[i].slice(0,3),mo:m,R:mInc,D:mExp,S:mInc-mExp};});
+  const annualInc=annualData.reduce((s,m)=>s+m.R,0);
+  const annualExp=annualData.reduce((s,m)=>s+m.D,0);
+  const annualSave=annualInc-annualExp;
   const calYear=parseInt(fMonth.slice(0,4)),calMo=parseInt(fMonth.slice(5,7))-1;
   const firstDay=new Date(calYear,calMo,1).getDay();
   const daysInMonth=new Date(calYear,calMo+1,0).getDate();
@@ -1473,8 +1570,17 @@ function App(){
             <div style={{...S.card,background:"linear-gradient(135deg,#E07B54,#C45A32)"}}><div style={S.cLbl}>Despesas</div><div style={S.cVal}>{fmt(exp)}</div></div>
             <div style={{...S.card,background:"linear-gradient(135deg,#6B9E8E,#4A7D6E)"}}><div style={S.cLbl}>Receitas</div><div style={S.cVal}>{fmt(inc)}</div></div>
             <div style={{...S.card,gridColumn:"span 2",background:bal>=0?"linear-gradient(135deg,#5B8FC9,#3A6EA8)":"linear-gradient(135deg,#C45A32,#A03A1A)"}}>
-              <div style={S.cLbl}>Saldo do Mês</div><div style={{...S.cVal,fontSize:24}}>{fmt(bal)}</div>
-              <div style={{color:"rgba(255,255,255,0.7)",fontSize:11,marginTop:3}}>{bal>=0?"✅ Mês positivo!":"⚠️ Despesas acima das receitas"}</div>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+                <div style={{flex:1}}>
+                  <div style={S.cLbl}>Saldo do Mês</div><div style={{...S.cVal,fontSize:24}}>{fmt(bal)}</div>
+                  <div style={{color:"rgba(255,255,255,0.7)",fontSize:11,marginTop:3}}>{bal>=0?"✅ Mês positivo!":"⚠️ Despesas acima das receitas"}</div>
+                </div>
+                {inc>0&&<div style={{textAlign:"right",marginLeft:10}}>
+                  <div style={{...S.cLbl,margin:0}}>Poupança</div>
+                  <div style={{fontSize:22,fontWeight:700,color:savingsRate>=20?"#D4F5E8":savingsRate>=0?"#FFF4D4":"#FFD4D4"}}>{savingsRate}%</div>
+                  <div style={{fontSize:10,color:"rgba(255,255,255,0.7)"}}>{savingsRate>=20?"💪 Excelente":savingsRate>=10?"👍 Bom":savingsRate>=0?"🤏 Baixo":"🚨 Negativo"}</div>
+                </div>}
+              </div>
             </div>
           </div>
           <div style={{display:"flex",gap:7,marginBottom:12,flexWrap:"wrap"}}>
@@ -1500,6 +1606,36 @@ function App(){
               ))}
             </div>
             {exp>0&&cmpExp>0&&<div style={{marginTop:8,fontSize:12,color:"#9A7B6A",textAlign:"center"}}>{exp>cmpExp?`📈 Mais ${fmt(exp-cmpExp)}`:`📉 Menos ${fmt(cmpExp-exp)}`} vs {MNS[parseInt(cmpMonth.slice(5,7))-1]}</div>}
+          </div>
+          <div style={S.box}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+              <div style={S.boxTitle}>🗓️ Resumo Anual {curYear}</div>
+              <div style={{fontSize:11,color:annualSave>=0?"#4A7D6E":"#C45A32",fontWeight:700}}>{annualSave>=0?"+":""}{fmt(annualSave)}</div>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:4,marginBottom:8}}>
+              {annualData.map((m,i)=>{
+                const isCur=m.mo===fMonth;
+                const hasData=m.R>0||m.D>0;
+                return <button key={i} onClick={()=>setFMonth(m.mo)} style={{padding:"8px 2px",borderRadius:8,border:isCur?"2px solid #E07B54":"1px solid #F0E4D8",background:hasData?(m.S>=0?"#F0FAF5":"#FAEEE8"):"#FAFAF5",cursor:"pointer",fontFamily:"inherit"}}>
+                  <div style={{fontSize:10,color:"#9A7B6A",fontWeight:700,marginBottom:2}}>{m.name}</div>
+                  <div style={{fontSize:10,fontWeight:700,color:m.S>=0?"#4A7D6E":"#C45A32"}}>{hasData?fmt(m.S).replace(/\s€/,""):"—"}</div>
+                </button>;
+              })}
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6,fontSize:11}}>
+              <div style={{background:"#FAEEE8",borderRadius:8,padding:7,textAlign:"center"}}>
+                <div style={{color:"#9A7B6A",fontSize:10}}>Despesas</div>
+                <div style={{fontWeight:700,color:"#C45A32"}}>{fmt(annualExp)}</div>
+              </div>
+              <div style={{background:"#E8F4F0",borderRadius:8,padding:7,textAlign:"center"}}>
+                <div style={{color:"#9A7B6A",fontSize:10}}>Receitas</div>
+                <div style={{fontWeight:700,color:"#4A7D6E"}}>{fmt(annualInc)}</div>
+              </div>
+              <div style={{background:annualSave>=0?"#E8F0FF":"#FAEEE8",borderRadius:8,padding:7,textAlign:"center"}}>
+                <div style={{color:"#9A7B6A",fontSize:10}}>Poupança</div>
+                <div style={{fontWeight:700,color:annualSave>=0?"#5B8FC9":"#C45A32"}}>{annualInc>0?Math.round((annualSave/annualInc)*100):0}%</div>
+              </div>
+            </div>
           </div>
           <div style={S.box}>
             <div style={S.boxTitle}>Últimos 6 meses</div>
@@ -1551,7 +1687,12 @@ function App(){
             </div>)}
             {(state.recurring||[]).length>0&&<button style={{...S.expBtn,marginTop:10,borderColor:"#B07CC6",color:"#B07CC6"}} onClick={applyRecurring}>🔁 Aplicar a {ml}</button>}
           </div>
-          {monthTxs.length===0&&<div style={S.empty}><div style={{fontSize:40}}>🐷</div><p>Sem movimentos em {ml}.<br/>Clica em ＋ para adicionar!</p></div>}
+          {monthTxs.length===0&&<div style={S.empty}>
+            <div style={{fontSize:52,marginBottom:6}}>🐷</div>
+            <p style={{fontSize:14,fontWeight:700,color:"#3D2B1A",marginBottom:6}}>Ainda sem movimentos em {ml}</p>
+            <p style={{fontSize:12,color:"#9A7B6A",marginBottom:14}}>Começa por registar as despesas da semana<br/>ou escaneia um recibo com a câmara.</p>
+            <button style={{...S.saveBtn,maxWidth:220,margin:"0 auto"}} onClick={()=>setAddOpen(true)}>＋ Adicionar primeiro movimento</button>
+          </div>}
         </>}
 
         {tab==="txs"&&<>
@@ -1573,7 +1714,7 @@ function App(){
                 {tx.photo?<img src={tx.photo} style={{width:"100%",height:"100%",objectFit:"cover",borderRadius:12}} alt=""/>:ALLCATS[tx.category]?.slice(0,2)||"📦"}
               </div>
               <div style={S.txInf}>
-                <div style={S.txD}>{tx.description||ALLCATS[tx.category]||tx.category}{tx.split&&<span style={{fontSize:9,color:"#B07CC6",marginLeft:5,background:"#F3EAFF",padding:"1px 5px",borderRadius:8}}>split</span>}{tx.recurring_id&&<span style={{fontSize:9,color:"#5B8FC9",marginLeft:4}}>🔁</span>}</div>
+                <div style={S.txD}>{tx.description||ALLCATS[tx.category]||tx.category}{tx.split&&<span style={{fontSize:9,color:"#B07CC6",marginLeft:5,background:"#F3EAFF",padding:"1px 5px",borderRadius:8}}>split</span>}{tx.category==="transfer"&&<span style={{fontSize:9,color:"#5B8FC9",marginLeft:5,background:"#E8F0FF",padding:"1px 5px",borderRadius:8}}>{tx.transfer_side==="out"?"↗":"↙"} transf.</span>}{tx.reimbursable&&<span style={{fontSize:9,color:tx.reimbursed?"#4A7D6E":"#8A6B2E",marginLeft:5,background:tx.reimbursed?"#E8F4F0":"#FFF4E0",padding:"1px 5px",borderRadius:8}}>{tx.reimbursed?"✓ reemb.":"⏳ reemb."}</span>}{tx.recurring_id&&<span style={{fontSize:9,color:"#5B8FC9",marginLeft:4}}>🔁</span>}</div>
                 <div style={S.txM}>{tx.date} · <span style={{color:UC[tx.user]||"#999"}}>{tx.user}</span>{tx.account&&<span style={{color:"#9A7B6A"}}> · {tx.account}</span>}</div>
               </div>
               <div style={{...S.txA,color:tx.type==="income"?"#4A7D6E":"#C45A32"}}>{tx.type==="income"?"+":"-"}{fmt(tx.amount)}</div>
@@ -1587,7 +1728,12 @@ function App(){
             <div><div style={{fontWeight:700,fontSize:15,color:"#3D2B1A"}}>Objetivos de Poupança</div><div style={{fontSize:12,color:"#9A7B6A"}}>Cofrinhos para os vossos sonhos</div></div>
             <button style={{...S.miniBtn,borderColor:"#E07B54",color:"#E07B54",padding:"8px 14px"}} onClick={()=>setGoalOpen(true)}>＋ Novo</button>
           </div>
-          {!(state.goals||[]).length&&<div style={S.empty}><div style={{fontSize:44}}>🐷</div><p>Ainda sem objetivos.<br/>Cria o primeiro!</p></div>}
+          {!(state.goals||[]).length&&<div style={S.empty}>
+            <div style={{fontSize:56,marginBottom:4}}>🐷</div>
+            <p style={{fontSize:14,fontWeight:700,color:"#3D2B1A",marginBottom:4}}>O cofrinho está à espera!</p>
+            <p style={{fontSize:12,color:"#9A7B6A",marginBottom:14}}>Viagem, carro novo, casa... define<br/>os sonhos e vê a poupança crescer.</p>
+            <button style={{...S.saveBtn,maxWidth:220,margin:"0 auto"}} onClick={()=>setGoalOpen(true)}>🎯 Criar primeiro objetivo</button>
+          </div>}
           {(state.goals||[]).map(g=>{
             const pct=Math.min(g.current/(g.target||1)*100,100),done=g.current>=g.target;
             return<div key={g.id} style={{...S.box,border:done?"2px solid #6B9E8E":"1px solid transparent"}}>
@@ -1646,7 +1792,7 @@ function App(){
       </div>
 
       {addOpen&&<AddModal onSave={addTx} onClose={()=>setAddOpen(false)} customCats={customCats} onOpenCatModal={()=>{setAddOpen(false);setCatModalOpen(true);}}/>}
-      {detailTx&&<DetailModal tx={detailTx} onDelete={delTx} onClose={()=>setDetailTx(null)}/>}
+      {detailTx&&<DetailModal tx={detailTx} onDelete={delTx} onReimburse={markReimbursed} onClose={()=>setDetailTx(null)}/>}
       {budgetOpen&&<BudgetModal month={fMonth} ml={ml} budgets={state.budgets} onSave={saveBdg} onClose={()=>setBudgetOpen(false)}/>}
       {goalOpen&&<GoalModal onSave={addGoal} onClose={()=>setGoalOpen(false)}/>}
       {recurOpen&&<RecurModal onSave={saveRecur} onClose={()=>setRecurOpen(false)}/>}
