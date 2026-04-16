@@ -30,7 +30,7 @@ input,select,textarea{font-size:16px!important}
 <script type="text/babel" data-type="module">
 const{useState,useEffect,useCallback,useRef}=React;
 
-const APP_VERSION="14";
+const APP_VERSION="15";
 
 /* ============ SHARED MODAL HEADER ============ */
 function ModalHeader({title,onClose,icon}){
@@ -374,22 +374,18 @@ async function syncWrite(data){
   }catch(e){console.error("syncWrite:",e);return false;}
 }
 
-// ============ NOTIFICATIONS ============
-function requestNotifPermission(){
-  if("Notification" in window && Notification.permission==="default"){
-    Notification.requestPermission();
-  }
+// ============ IN-APP DAILY REMINDER (works on all devices incl. iOS) ============
+function shouldShowReminder(transactions){
+  const h=new Date().getHours();
+  if(h<19)return false; // only after 19h
+  const todayKey="fm_reminder_"+tod();
+  if(localStorage.getItem(todayKey))return false;
+  // Don't show if user already logged something today
+  const todayTxs=(transactions||[]).filter(t=>t.date===tod());
+  if(todayTxs.length>0)return false;
+  return true;
 }
-function checkDailyNotif(){
-  if(!("Notification" in window)||Notification.permission!=="granted")return;
-  const now=new Date();
-  const h=now.getHours(),m=now.getMinutes();
-  const todayKey="fm_notif_"+tod();
-  if(h===21 && m<5 && !localStorage.getItem(todayKey)){
-    new Notification("🐷 Família Martinho",{body:"Já registaste as despesas de hoje?",tag:"daily-reminder"});
-    localStorage.setItem(todayKey,"1");
-  }
-}
+function markReminderShown(){localStorage.setItem("fm_reminder_"+tod(),"1");}
 
 // ============ LOCAL AI ANALYSIS ============
 function analyzeLocally(state,month,monthLabel){
@@ -779,8 +775,8 @@ function SettingsModal({notifsEnabled,onToggleNotifs,onOpenSync,onOpenCatModal,d
         <div style={{display:"flex",alignItems:"center",gap:10}}>
           <span style={{fontSize:24}}>🔔</span>
           <div style={{flex:1}}>
-            <div style={{fontWeight:700,fontSize:14,color:"#3D2B1A"}}>Lembrete diário (21h)</div>
-            <div style={{fontSize:12,color:"#9A7B6A"}}>Notificação para registar despesas</div>
+            <div style={{fontWeight:700,fontSize:14,color:"#3D2B1A"}}>Lembrete diário</div>
+            <div style={{fontSize:12,color:"#9A7B6A"}}>Aviso na app após as 19h se não registaste nada</div>
           </div>
           <button style={{width:50,height:28,borderRadius:14,border:"none",cursor:"pointer",background:notifsEnabled?"#6B9E8E":"#E0CEBE",position:"relative",transition:"background 0.3s"}} onClick={onToggleNotifs}>
             <div style={{width:22,height:22,borderRadius:11,background:"#fff",position:"absolute",top:3,left:notifsEnabled?25:3,transition:"left 0.3s",boxShadow:"0 1px 3px rgba(0,0,0,0.2)"}}/>
@@ -1311,7 +1307,6 @@ function App(){
   useEffect(()=>{
     const saved=loadLocal();
     setState(saved||{transactions:SEED_TRANSACTIONS,budgets:{},goals:[],recurring:[]});
-    requestNotifPermission();
   },[]);
 
   // Save dark mode and custom categories
@@ -1369,13 +1364,18 @@ function App(){
     return()=>{window.removeEventListener("online",on);window.removeEventListener("offline",off);};
   },[]);
 
-  // Notification timer
+  // In-app reminder state
+  const[reminder,setReminder]=useState(false);
   useEffect(()=>{
-    if(!notifsEnabled)return;
-    const iv=setInterval(checkDailyNotif,60000);
-    checkDailyNotif();
-    return()=>clearInterval(iv);
-  },[notifsEnabled]);
+    if(!notifsEnabled||!state)return;
+    const check=()=>{if(shouldShowReminder(state.transactions))setReminder(true);};
+    check();
+    const iv=setInterval(check,60000);
+    // Also check when app comes back to foreground
+    const onVis=()=>{if(!document.hidden)check();};
+    document.addEventListener("visibilitychange",onVis);
+    return()=>{clearInterval(iv);document.removeEventListener("visibilitychange",onVis);};
+  },[notifsEnabled,state]);
 
   const toast$=useCallback((msg,warn=false)=>{setToast({msg,warn});setTimeout(()=>setToast(null),2800);},[]);
   const addTx=useCallback(tx=>{
@@ -1455,13 +1455,15 @@ function App(){
 
   const handleToggleNotifs=useCallback(()=>{
     if(!notifsEnabled){
-      if("Notification" in window){
-        Notification.requestPermission().then(p=>{
-          if(p==="granted"){setNotifsEnabled(true);localStorage.setItem("fm_notifs","1");toast$("Notificações ativadas");}
-          else{toast$("Permissão negada","warn");}
-        });
-      }else{toast$("Não suportado","warn");}
-    }else{setNotifsEnabled(false);localStorage.setItem("fm_notifs","0");toast$("Notificações desativadas");}
+      setNotifsEnabled(true);
+      localStorage.setItem("fm_notifs","1");
+      toast$("Lembrete diário ativado");
+    }else{
+      setNotifsEnabled(false);
+      localStorage.setItem("fm_notifs","0");
+      setReminder(false);
+      toast$("Lembrete desativado");
+    }
   },[notifsEnabled,toast$]);
 
   const handleSyncCreate=useCallback(async()=>{
@@ -1567,6 +1569,19 @@ function App(){
     <div style={{...S.root,background:getDarkColor("#FEF5EC","#1A1A2E"),color:getDarkColor("#3D2B1A","#E8E8E8")}} className="app-root">
       {toast&&<div style={{...S.toast,background:toast.warn?"#C45A32":"#4A7D6E"}}>{toast.msg}</div>}
       {syncPulse&&<div style={S.sync}>🔄 Sincronizado</div>}
+      {reminder&&<div style={{position:"fixed",top:0,left:0,right:0,zIndex:2500,display:"flex",justifyContent:"center",padding:"calc(env(safe-area-inset-top,8px) + 8px) 12px 8px"}}>
+        <div style={{background:"linear-gradient(135deg,#E07B54,#C45A32)",color:"#fff",padding:"14px 18px",borderRadius:16,boxShadow:"0 6px 24px rgba(196,90,50,0.4)",maxWidth:400,width:"100%",display:"flex",alignItems:"center",gap:12}}>
+          <span style={{fontSize:28}}>🐷</span>
+          <div style={{flex:1}}>
+            <div style={{fontWeight:700,fontSize:14}}>Já registaste as despesas de hoje?</div>
+            <div style={{fontSize:11,opacity:0.85,marginTop:2}}>Lembrete diário — toca para adicionar</div>
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:6}}>
+            <button onClick={()=>{setReminder(false);markReminderShown();setAddOpen(true);}} style={{background:"rgba(255,255,255,0.25)",border:"1.5px solid rgba(255,255,255,0.5)",color:"#fff",borderRadius:10,padding:"6px 12px",fontSize:11,fontWeight:700,cursor:"pointer",fontFamily:"inherit"}}>＋</button>
+            <button onClick={()=>{setReminder(false);markReminderShown();}} style={{background:"none",border:"none",color:"rgba(255,255,255,0.7)",fontSize:10,cursor:"pointer",fontFamily:"inherit"}}>Fechar</button>
+          </div>
+        </div>
+      </div>}
       <div style={S.hdr}>
         <div style={S.hdrL}><span style={{fontSize:32}}>🐷</span><div><div style={S.hTitle}>Família Martinho</div><div style={S.hSub}>Gestão Financeira</div></div></div>
         <div style={{display:"flex",gap:6}}>
