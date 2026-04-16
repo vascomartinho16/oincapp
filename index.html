@@ -30,7 +30,7 @@ input,select,textarea{font-size:16px!important}
 <script type="text/babel" data-type="module">
 const{useState,useEffect,useCallback,useRef}=React;
 
-const APP_VERSION="13";
+const APP_VERSION="14";
 
 /* ============ SHARED MODAL HEADER ============ */
 function ModalHeader({title,onClose,icon}){
@@ -1927,11 +1927,29 @@ function Root(){
 ReactDOM.createRoot(document.getElementById("root")).render(<Root/>);
 </script>
 <script>
-// Service Worker Registration
-if('serviceWorker' in navigator){
-  window.addEventListener('load',()=>{
-    navigator.serviceWorker.register('sw.js').catch(()=>{});
-  });
+// Force reset: visit ?reset to clear all caches and service workers
+if(location.search.includes('reset')){
+  (async()=>{
+    // Unregister all service workers
+    if('serviceWorker' in navigator){
+      const regs=await navigator.serviceWorker.getRegistrations();
+      for(const r of regs)await r.unregister();
+    }
+    // Delete all caches
+    if('caches' in window){
+      const keys=await caches.keys();
+      for(const k of keys)await caches.delete(k);
+    }
+    // Clean URL and hard reload
+    location.replace(location.origin+location.pathname);
+  })();
+}else{
+  // Normal Service Worker Registration
+  if('serviceWorker' in navigator){
+    window.addEventListener('load',()=>{
+      navigator.serviceWorker.register('sw.js').catch(()=>{});
+    });
+  }
 }
 // Keyboard fix for iOS - prevent nav bar overlap
 if(window.visualViewport){
