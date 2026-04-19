@@ -30,7 +30,7 @@ input,select,textarea{font-size:16px!important}
 <script type="text/babel" data-type="module">
 const{useState,useEffect,useCallback,useRef}=React;
 
-const APP_VERSION="15";
+const APP_VERSION="16";
 
 /* ============ SHARED MODAL HEADER ============ */
 function ModalHeader({title,onClose,icon}){
@@ -304,7 +304,7 @@ async function syncCreate(data){
   const keyB64=await genSyncKey();
   const enc=await encryptPayload(data,keyB64);
   const body={ts:Date.now(),...enc};
-  for(const fn of [jsonblobCreate,npointCreate,ntfyCreate]){
+  for(const fn of [npointCreate,jsonblobCreate,ntfyCreate]){
     try{
       const id=await fn(body);
       const full=id+"#"+keyB64;
@@ -713,32 +713,49 @@ function AITab({state,fMonth,ml}){
 }
 
 // ============ SYNC SETTINGS MODAL ============
-function SyncModal({syncId,onSync,onJoin,onDisconnect,onClose}){
+function SyncModal({syncId,onSync,onJoin,onDisconnect,onClose,lastSyncAt,onSyncNow}){
   const[joinCode,setJoinCode]=useState("");
   const[creating,setCreating]=useState(false);
+  const[syncing,setSyncing]=useState(false);
+  const[testResult,setTestResult]=useState(null);
+  const doTest=async()=>{
+    setSyncing(true);setTestResult(null);
+    try{
+      const r=await syncRead();
+      if(r&&r.data){setTestResult({ok:true,msg:"✅ Ligação OK — "+((r.data.transactions||[]).length)+" movimentos no servidor"});}
+      else{setTestResult({ok:false,msg:"⚠️ Servidor respondeu vazio"+(LAST_SYNC_ERR?" — "+LAST_SYNC_ERR:"")});}
+    }catch(e){setTestResult({ok:false,msg:"❌ Erro: "+e.message});}
+    setSyncing(false);
+  };
   return<div style={S.ov} onClick={onClose}>
-    <div style={{...S.modal,position:"relative"}} onClick={e=>e.stopPropagation()}>
+    <div style={{...S.modal,position:"relative",maxHeight:"88vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
       <ModalHeader title="Sincronização" icon="🔗" onClose={onClose}/>
       {syncId?<div>
         <div style={{background:"#E8F4F0",borderRadius:12,padding:16,marginBottom:14,textAlign:"center"}}>
           <div style={{fontSize:11,color:"#4A7D6E",marginBottom:6,textTransform:"uppercase",letterSpacing:1}}>Código de Sincronização</div>
-          <div style={{fontSize:14,fontWeight:700,color:"#3D2B1A",wordBreak:"break-all",fontFamily:"monospace",padding:"8px",background:"#fff",borderRadius:8,marginBottom:10}}>{syncId}</div>
-          <button style={{...S.miniBtn,borderColor:"#6B9E8E",color:"#6B9E8E"}} onClick={()=>{navigator.clipboard?.writeText(syncId);alert("Código copiado!");}}>📋 Copiar código</button>
+          <div style={{fontSize:12,fontWeight:700,color:"#3D2B1A",wordBreak:"break-all",fontFamily:"monospace",padding:"8px",background:"#fff",borderRadius:8,marginBottom:10,userSelect:"all",WebkitUserSelect:"all"}}>{syncId}</div>
+          <button style={{...S.miniBtn,borderColor:"#6B9E8E",color:"#6B9E8E"}} onClick={()=>{navigator.clipboard?.writeText(syncId).then(()=>alert("Código copiado!")).catch(()=>{const ta=document.createElement("textarea");ta.value=syncId;document.body.appendChild(ta);ta.select();document.execCommand("copy");document.body.removeChild(ta);alert("Código copiado!");});}}>📋 Copiar código</button>
         </div>
-        <p style={{fontSize:12,color:"#9A7B6A",marginBottom:14,lineHeight:1.6,textAlign:"center"}}>Envia este código à Sara por WhatsApp. Ela cola em "Juntar sincronização" e pronto — dados partilhados!</p>
-        <div style={{background:"#E8F4F0",borderRadius:10,padding:"10px 14px",marginBottom:14}}>
+        <p style={{fontSize:12,color:"#9A7B6A",marginBottom:14,lineHeight:1.6,textAlign:"center"}}>Envia este código <strong>completo</strong> à Sara por WhatsApp.<br/>Ela cola em "Juntar sincronização" e pronto!</p>
+        <div style={{background:"#E8F4F0",borderRadius:10,padding:"10px 14px",marginBottom:10}}>
           <div style={{fontSize:11,color:"#4A7D6E",fontWeight:700}}>✅ Sincronização ativa {syncId.includes("#")&&"· 🔒 Cifrado E2E"}</div>
-          <div style={{fontSize:11,color:"#6B9E8E",marginTop:3}}>{syncId.includes("#")?"Dados cifrados com AES-256. Só quem tem o código consegue abrir.":"Os dados são sincronizados a cada 15s (modo antigo, sem cifra — cria uma nova para ativar)."}</div>
+          <div style={{fontSize:11,color:"#6B9E8E",marginTop:3}}>{lastSyncAt?"Último sync: "+timeSince(lastSyncAt):"A aguardar primeiro sync..."}</div>
         </div>
+        <div style={{display:"flex",gap:8,marginBottom:14}}>
+          <button style={{...S.expBtn,borderColor:"#5B8FC9",color:"#5B8FC9",flex:1}} disabled={syncing} onClick={async()=>{setSyncing(true);await onSyncNow();setSyncing(false);}}>{syncing?"⏳ ...":"🔄 Sincronizar agora"}</button>
+          <button style={{...S.expBtn,borderColor:"#9A7B6A",color:"#9A7B6A",flex:1}} disabled={syncing} onClick={doTest}>{syncing?"⏳ ...":"🧪 Testar ligação"}</button>
+        </div>
+        {testResult&&<div style={{background:testResult.ok?"#E8F4F0":"#FAEEE8",borderRadius:10,padding:"8px 12px",marginBottom:14,fontSize:12,color:testResult.ok?"#4A7D6E":"#C45A32"}}>{testResult.msg}</div>}
         <button style={{...S.delBtn}} onClick={()=>{if(confirm("Desligar sincronização?")){onDisconnect();}}}>🔌 Desligar sincronização</button>
       </div>:<div>
         <p style={{fontSize:13,color:"#3D2B1A",marginBottom:8,lineHeight:1.6,textAlign:"center"}}>Sincroniza os dados entre os telemóveis do Vasco e da Sara.</p>
         <p style={{fontSize:11,color:"#4A7D6E",marginBottom:16,textAlign:"center",fontWeight:700}}>🔒 Cifrado end-to-end (AES-256)</p>
-        <button style={{...S.saveBtn,marginBottom:14}} disabled={creating} onClick={async()=>{setCreating(true);await onSync();setCreating(false);}}>{creating?"⏳ A criar…":"🆕 Criar nova sincronização"}</button>
-        <div style={{borderTop:"1px solid #E0CEBE",paddingTop:14}}>
+        <button style={{...S.saveBtn,marginBottom:8}} disabled={creating} onClick={async()=>{setCreating(true);setTestResult(null);await onSync();if(LAST_SYNC_ERR)setTestResult({ok:false,msg:"❌ "+LAST_SYNC_ERR});setCreating(false);}}>{creating?"⏳ A criar…":"🆕 Criar nova sincronização"}</button>
+        {testResult&&!testResult.ok&&<div style={{background:"#FAEEE8",borderRadius:10,padding:"8px 12px",marginBottom:14,fontSize:11,color:"#C45A32",lineHeight:1.5}}>{testResult.msg}</div>}
+        <div style={{borderTop:"1px solid #E0CEBE",paddingTop:14,marginTop:6}}>
           <label style={S.fl}>Ou juntar a uma existente:</label>
-          <input style={S.inp} placeholder="Cola aqui o código recebido" value={joinCode} onChange={e=>setJoinCode(e.target.value)}/>
-          <button style={{...S.saveBtn,background:"linear-gradient(135deg,#6B9E8E,#4A7D6E)"}} onClick={()=>{if(joinCode.trim()){onJoin(joinCode.trim());}}}>🔗 Juntar sincronização</button>
+          <input style={S.inp} placeholder="Cola aqui o código completo" value={joinCode} onChange={e=>setJoinCode(e.target.value)}/>
+          <button style={{...S.saveBtn,background:"linear-gradient(135deg,#6B9E8E,#4A7D6E)"}} onClick={()=>{if(joinCode.trim()){onJoin(joinCode.trim());}else{alert("Cola o código de sincronização que recebeste.");}}}> 🔗 Juntar sincronização</button>
         </div>
       </div>}
       <button style={{...S.closeBtn,marginTop:8}} onClick={onClose}>Fechar</button>
@@ -987,9 +1004,45 @@ function AddModal({onSave,onClose,customCats,onOpenCatModal}){
   </div>;
 }
 
-// ============ DETAIL MODAL ============
-function DetailModal({tx,onDelete,onClose,onReimburse}){
+// ============ DETAIL MODAL (with inline edit) ============
+function DetailModal({tx,onDelete,onClose,onReimburse,onEdit,customCats}){
+  const[editing,setEditing]=useState(false);
+  const[amt,setAmt]=useState(String(tx.amount));
+  const[cat,setCat]=useState(tx.category);
+  const[user,setUser]=useState(tx.user);
+  const[acc,setAcc]=useState(tx.account||ACCS[0]);
+  const[date,setDate]=useState(tx.date);
+  const[desc,setDesc]=useState(tx.description||"");
   const isTransfer=tx.category==="transfer";
+  const defaultCats=tx.type==="expense"?ECATS:ICATS;
+  const cats=[...defaultCats,...(customCats?.[tx.type]||[])];
+  const save=()=>{
+    const a=parseFloat(String(amt).replace(",","."));
+    if(!a||a<=0)return;
+    onEdit(tx.id,{amount:a,category:cat,user,account:acc,date,description:desc});
+    setEditing(false);
+  };
+  if(editing&&!isTransfer)return<div style={S.ov} onClick={onClose}>
+    <div style={{...S.modal,position:"relative",maxHeight:"85vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
+      <ModalHeader title="Editar Movimento" icon="✏️" onClose={()=>setEditing(false)}/>
+      <label style={S.fl}>Valor (€)</label>
+      <input style={S.inp} type="number" inputMode="decimal" value={amt} onChange={e=>setAmt(e.target.value)} autoFocus/>
+      <label style={S.fl}>Pessoa</label>
+      <div style={{display:"flex",gap:8,marginBottom:13}}>
+        {USERS.map(u=><button key={u} style={{...S.tBtn,...(user===u?{background:UC[u],borderColor:UC[u],color:"#fff"}:{})}} onClick={()=>setUser(u)}>{u}</button>)}
+      </div>
+      <label style={S.fl}>Conta</label>
+      <select style={S.sel} value={acc} onChange={e=>setAcc(e.target.value)}>{ACCS.map(a=><option key={a} value={a}>{a}</option>)}</select>
+      <label style={S.fl}>Categoria</label>
+      <select style={S.sel} value={cat} onChange={e=>setCat(e.target.value)}>{cats.map(c=><option key={c.id} value={c.id}>{c.l}</option>)}</select>
+      <label style={S.fl}>Data</label>
+      <input style={S.inp} type="date" value={date} onChange={e=>setDate(e.target.value)}/>
+      <label style={S.fl}>Nota</label>
+      <input style={S.inp} type="text" value={desc} onChange={e=>setDesc(e.target.value)}/>
+      <button style={S.saveBtn} onClick={save}>💾 Guardar alterações</button>
+      <button style={S.closeBtn} onClick={()=>setEditing(false)}>Cancelar</button>
+    </div>
+  </div>;
   return<div style={S.ov} onClick={onClose}>
     <div style={{...S.modal,position:"relative"}} onClick={e=>e.stopPropagation()}>
       <ModalHeader title="Detalhe" onClose={onClose}/>
@@ -1012,6 +1065,7 @@ function DetailModal({tx,onDelete,onClose,onReimburse}){
         {tx.recurring_id&&<><span style={S.dL}>Tipo</span><span style={{color:"#5B8FC9"}}>🔁 Recorrente</span></>}
       </div>
       {tx.reimbursable&&!tx.reimbursed&&tx.type==="expense"&&<button style={{...S.saveBtn,background:"linear-gradient(135deg,#E8A44A,#C4833A)"}} onClick={()=>{onReimburse(tx.id);onClose();}}>💵 Marcar como reembolsado</button>}
+      {!isTransfer&&<button style={{...S.saveBtn,background:"linear-gradient(135deg,#5B8FC9,#3A6FA5)",marginBottom:8}} onClick={()=>setEditing(true)}>✏️ Editar</button>}
       <button style={S.delBtn} onClick={()=>onDelete(tx.id)}>🗑️ Eliminar</button>
       <button style={S.closeBtn} onClick={onClose}>Fechar</button>
     </div>
@@ -1407,6 +1461,11 @@ function App(){
     toast$("Marcado como reembolsado");
   },[toast$]);
   const delTx=useCallback(id=>{setState(s=>({...s,transactions:s.transactions.filter(t=>t.id!==id)}));setDetailTx(null);toast$("Eliminado","warn");},[toast$]);
+  const editTx=useCallback((id,updates)=>{
+    setState(s=>({...s,transactions:s.transactions.map(t=>t.id===id?{...t,...updates}:t)}));
+    setDetailTx(prev=>prev&&prev.id===id?{...prev,...updates}:prev);
+    toast$("Movimento atualizado");
+  },[toast$]);
   const saveBdg=useCallback((cat,amt)=>setState(s=>({...s,budgets:{...s.budgets,[`${fMonth}:${cat}`]:amt}})),[fMonth]);
   const addGoal=useCallback(g=>{setState(s=>({...s,goals:[...s.goals,{...g,id:uid(),current:0}]}));setGoalOpen(false);toast$("Objetivo criado");},[toast$]);
   const addToGoal=useCallback((id,amt)=>setState(s=>({...s,goals:s.goals.map(g=>g.id===id?{...g,current:Math.min(g.current+amt,g.target)}:g)})),[]);
@@ -1841,11 +1900,11 @@ function App(){
       </div>
 
       {addOpen&&<AddModal onSave={addTx} onClose={()=>setAddOpen(false)} customCats={customCats} onOpenCatModal={()=>{setAddOpen(false);setCatModalOpen(true);}}/>}
-      {detailTx&&<DetailModal tx={detailTx} onDelete={delTx} onReimburse={markReimbursed} onClose={()=>setDetailTx(null)}/>}
+      {detailTx&&<DetailModal tx={detailTx} onDelete={delTx} onEdit={editTx} onReimburse={markReimbursed} onClose={()=>setDetailTx(null)} customCats={customCats}/>}
       {budgetOpen&&<BudgetModal month={fMonth} ml={ml} budgets={state.budgets} onSave={saveBdg} onClose={()=>setBudgetOpen(false)}/>}
       {goalOpen&&<GoalModal onSave={addGoal} onClose={()=>setGoalOpen(false)}/>}
       {recurOpen&&<RecurModal onSave={saveRecur} onClose={()=>setRecurOpen(false)}/>}
-      {syncOpen&&<SyncModal syncId={syncId} onSync={handleSyncCreate} onJoin={handleSyncJoin} onDisconnect={handleSyncDisconnect} onClose={()=>setSyncOpen(false)}/>}
+      {syncOpen&&<SyncModal syncId={syncId} onSync={handleSyncCreate} onJoin={handleSyncJoin} onDisconnect={handleSyncDisconnect} onClose={()=>setSyncOpen(false)} lastSyncAt={lastSyncAt} onSyncNow={async()=>{if(!state)return;const ok=await syncWrite(state);if(ok){setLastSyncAt(Date.now());toast$("Dados enviados");const r=await syncRead();if(r?.data){setState(local=>{const localIds=new Set(local.transactions.map(t=>t.id));const merged=[...local.transactions];(r.data.transactions||[]).forEach(t=>{if(!localIds.has(t.id))merged.push(t);});if(merged.length!==local.transactions.length){setSyncPulse(true);setTimeout(()=>setSyncPulse(false),3000);const ns={...local,transactions:merged,goals:[...(r.data.goals||local.goals)],recurring:[...(r.data.recurring||local.recurring)]};saveLocal(ns);return ns;}return local;});}}else{toast$("Erro ao sincronizar","warn");}}}/>}
       {settingsOpen&&<SettingsModal notifsEnabled={notifsEnabled} onToggleNotifs={handleToggleNotifs} onOpenSync={()=>{setSettingsOpen(false);setSyncOpen(true);}} onOpenCatModal={()=>{setSettingsOpen(false);setCatModalOpen(true);}} darkMode={darkMode} onToggleDarkMode={handleToggleDarkMode} onClose={()=>setSettingsOpen(false)} onExport={handleExport} onImport={handleImport} lastSyncAt={lastSyncAt} syncId={syncId}/>}
       {catModalOpen&&<CategoryModal customCats={customCats} onAddCat={addCustomCat} onDelCat={delCustomCat} darkMode={darkMode} onClose={()=>setCatModalOpen(false)}/>}
     </div>
