@@ -30,7 +30,7 @@ input,select,textarea{font-size:16px!important}
 <script type="text/babel" data-type="module">
 const{useState,useEffect,useCallback,useRef}=React;
 
-const APP_VERSION="16";
+const APP_VERSION="17";
 
 /* ============ SHARED MODAL HEADER ============ */
 function ModalHeader({title,onClose,icon}){
@@ -241,9 +241,12 @@ function readJSONFile(file){
   });
 }
 
-// ============ SYNC com E2E Encryption (AES-GCM 256) ============
+// ============ SYNC via GitHub repo (fiável) + E2E Encryption ============
 const SYNC_ID_KEY="fm_sync_id";
 const SYNC_TS_KEY="fm_sync_ts";
+const GH_PAT_KEY="fm_gh_pat";
+const GH_REPO="vascomartinho16/oincapp";
+const GH_FILE="sync.json";
 
 let LAST_SYNC_ERR="";
 
@@ -269,106 +272,85 @@ async function decryptPayload(obj,keyB64){
   const pt=await crypto.subtle.decrypt({name:"AES-GCM",iv:b64dec(obj.iv)},key,b64dec(obj.ct));
   return JSON.parse(new TextDecoder().decode(pt));
 }
-function splitSyncId(full){const i=(full||"").indexOf("#");return i<0?{id:full||"",key:null}:{id:full.slice(0,i),key:full.slice(i+1)};}
 
-// === Backend creators (receive final body object) ===
-async function jsonblobCreate(body){
-  const res=await fetch("https://jsonblob.com/api/jsonBlob",{method:"POST",headers:{"Content-Type":"application/json","Accept":"application/json"},body:JSON.stringify(body)});
-  if(!res.ok)throw new Error("jsonblob HTTP "+res.status);
-  let id=null;
-  for(const[k,v]of res.headers.entries()){if(k.toLowerCase()==="location"){id=v.split("/").pop();break;}}
-  if(!id&&res.url){const m=res.url.match(/\/jsonBlob\/([^/?#]+)/);if(m)id=m[1];}
-  if(!id)throw new Error("jsonblob: Location header bloqueado por CORS");
-  return "JB:"+id;
+// --- GitHub sync backend ---
+function getGHPat(){return localStorage.getItem(GH_PAT_KEY)||"";}
+
+async function ghRead(){
+  // Read via raw.githubusercontent.com (no auth needed, public repo)
+  const res=await fetch("https://raw.githubusercontent.com/"+GH_REPO+"/main/"+GH_FILE+"?t="+Date.now(),{cache:"no-store"});
+  if(res.status===404)return null; // file doesn't exist yet
+  if(!res.ok)throw new Error("GitHub read HTTP "+res.status);
+  return await res.json();
 }
-async function npointCreate(body){
-  const res=await fetch("https://api.npoint.io",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
-  if(!res.ok)throw new Error("npoint HTTP "+res.status);
-  const j=await res.json().catch(()=>null);
-  if(!j||!j.id)throw new Error("npoint: resposta sem id");
-  return "NP:"+j.id;
-}
-async function ntfyCreate(body){
-  const chars="abcdefghjkmnpqrstuvwxyz23456789";
-  let topic="oinc-";
-  const rnd=crypto.getRandomValues(new Uint8Array(16));
-  for(let i=0;i<16;i++)topic+=chars[rnd[i]%chars.length];
-  const res=await fetch("https://ntfy.sh/"+topic,{method:"POST",headers:{"Content-Type":"text/plain"},body:JSON.stringify(body)});
-  if(!res.ok)throw new Error("ntfy HTTP "+res.status);
-  return "NT:"+topic;
+
+async function ghWrite(content){
+  const pat=getGHPat();
+  if(!pat)throw new Error("GitHub PAT não configurado");
+  // Get current file SHA (needed for updates)
+  let sha=null;
+  try{
+    const meta=await fetch("https://api.github.com/repos/"+GH_REPO+"/contents/"+GH_FILE,{
+      headers:{"Authorization":"token "+pat,"Accept":"application/vnd.github+json"}
+    });
+    if(meta.ok){const j=await meta.json();sha=j.sha;}
+  }catch{}
+  // Write file
+  const body={message:"sync update",content:btoa(unescape(encodeURIComponent(JSON.stringify(content,null,0))))};
+  if(sha)body.sha=sha;
+  const res=await fetch("https://api.github.com/repos/"+GH_REPO+"/contents/"+GH_FILE,{
+    method:"PUT",
+    headers:{"Authorization":"token "+pat,"Accept":"application/vnd.github+json","Content-Type":"application/json"},
+    body:JSON.stringify(body)
+  });
+  if(!res.ok){const t=await res.text().catch(()=>"");throw new Error("GitHub write HTTP "+res.status+" "+t.slice(0,100));}
+  return true;
 }
 
 async function syncCreate(data){
   LAST_SYNC_ERR="";
-  const errs=[];
-  const keyB64=await genSyncKey();
-  const enc=await encryptPayload(data,keyB64);
-  const body={ts:Date.now(),...enc};
-  for(const fn of [npointCreate,jsonblobCreate,ntfyCreate]){
-    try{
-      const id=await fn(body);
-      const full=id+"#"+keyB64;
-      localStorage.setItem(SYNC_ID_KEY,full);
-      return full;
-    }catch(e){console.warn(fn.name,"failed:",e);errs.push(fn.name+": "+e.message);}
+  const pat=getGHPat();
+  if(!pat){LAST_SYNC_ERR="Insere o GitHub PAT primeiro";return null;}
+  try{
+    const keyB64=await genSyncKey();
+    const enc=await encryptPayload(data,keyB64);
+    const body={ts:Date.now(),...enc};
+    await ghWrite(body);
+    const syncId="GH#"+keyB64;
+    localStorage.setItem(SYNC_ID_KEY,syncId);
+    return syncId;
+  }catch(e){
+    LAST_SYNC_ERR=e.message;
+    console.error("syncCreate:",e);
+    return null;
   }
-  LAST_SYNC_ERR=errs.join(" | ");
-  return null;
-}
-
-function syncUrl(id){
-  if(id.startsWith("JB:"))return{url:"https://jsonblob.com/api/jsonBlob/"+id.slice(3),isNtfy:false};
-  if(id.startsWith("NP:"))return{url:"https://api.npoint.io/"+id.slice(3),isNtfy:false};
-  if(id.startsWith("NT:"))return{url:"https://ntfy.sh/"+id.slice(3)+"/json?poll=1&since=all",isNtfy:true};
-  return{url:"https://jsonblob.com/api/jsonBlob/"+id,isNtfy:false};
 }
 
 async function syncRead(){
   const full=localStorage.getItem(SYNC_ID_KEY);
   if(!full)return null;
-  const{id,key}=splitSyncId(full);
+  const key=full.startsWith("GH#")?full.slice(3):null;
+  if(!key)return null;
   try{
-    const{url,isNtfy}=syncUrl(id);
-    const res=await fetch(url,{headers:{"Accept":"application/json"}});
-    if(!res.ok)return null;
-    let body;
-    if(isNtfy){
-      const text=await res.text();
-      const lines=text.trim().split("\n").filter(Boolean);
-      if(!lines.length)return null;
-      const last=JSON.parse(lines[lines.length-1]);
-      body=JSON.parse(last.message);
-    }else{
-      body=await res.json();
+    const body=await ghRead();
+    if(!body)return null;
+    if(body.enc==="v1"){
+      const data=await decryptPayload(body,key);
+      return{ts:body.ts,data};
     }
-    if(body&&body.enc==="v1"){
-      if(!key)return null; // encrypted but no local key
-      try{const data=await decryptPayload(body,key);return{ts:body.ts,data};}
-      catch(e){console.error("decrypt failed:",e);return null;}
-    }
-    return body; // legacy unencrypted
-  }catch{return null;}
+    return body;
+  }catch(e){console.error("syncRead:",e);return null;}
 }
 
 async function syncWrite(data){
   const full=localStorage.getItem(SYNC_ID_KEY);
   if(!full)return false;
-  const{id,key}=splitSyncId(full);
+  const key=full.startsWith("GH#")?full.slice(3):null;
+  if(!key)return false;
   try{
-    let body;
-    if(key){
-      const enc=await encryptPayload(data,key);
-      body={ts:Date.now(),...enc};
-    }else{
-      body={ts:Date.now(),data};
-    }
-    const bodyStr=JSON.stringify(body);
-    if(id.startsWith("NT:")){
-      await fetch("https://ntfy.sh/"+id.slice(3),{method:"POST",headers:{"Content-Type":"text/plain"},body:bodyStr});
-    }else{
-      const{url}=syncUrl(id);
-      await fetch(url,{method:"PUT",headers:{"Content-Type":"application/json","Accept":"application/json"},body:bodyStr});
-    }
+    const enc=await encryptPayload(data,key);
+    const body={ts:Date.now(),...enc};
+    await ghWrite(body);
     localStorage.setItem("fm_last_sync",String(Date.now()));
     return true;
   }catch(e){console.error("syncWrite:",e);return false;}
@@ -715,9 +697,13 @@ function AITab({state,fMonth,ml}){
 // ============ SYNC SETTINGS MODAL ============
 function SyncModal({syncId,onSync,onJoin,onDisconnect,onClose,lastSyncAt,onSyncNow}){
   const[joinCode,setJoinCode]=useState("");
+  const[pat,setPat]=useState(()=>getGHPat());
   const[creating,setCreating]=useState(false);
   const[syncing,setSyncing]=useState(false);
   const[testResult,setTestResult]=useState(null);
+  const[showPat,setShowPat]=useState(false);
+  const savePat=(v)=>{setPat(v);localStorage.setItem(GH_PAT_KEY,v);};
+  const encKey=syncId&&syncId.startsWith("GH#")?syncId.slice(3):"";
   const doTest=async()=>{
     setSyncing(true);setTestResult(null);
     try{
@@ -727,18 +713,27 @@ function SyncModal({syncId,onSync,onJoin,onDisconnect,onClose,lastSyncAt,onSyncN
     }catch(e){setTestResult({ok:false,msg:"❌ Erro: "+e.message});}
     setSyncing(false);
   };
+  const patInput=<div style={{marginBottom:14}}>
+    <label style={{...S.fl,fontSize:11,marginBottom:4}}>GitHub Token (PAT)</label>
+    <div style={{position:"relative"}}>
+      <input style={{...S.inp,paddingRight:40,fontFamily:"monospace",fontSize:11}} type={showPat?"text":"password"} placeholder="github_pat_..." value={pat} onChange={e=>savePat(e.target.value)}/>
+      <button style={{position:"absolute",right:8,top:"50%",transform:"translateY(-50%)",background:"none",border:"none",fontSize:16,cursor:"pointer",padding:0}} onClick={()=>setShowPat(!showPat)}>{showPat?"🙈":"👁️"}</button>
+    </div>
+    {pat&&<div style={{fontSize:10,color:"#4A7D6E",marginTop:4}}>✅ Token guardado</div>}
+  </div>;
   return<div style={S.ov} onClick={onClose}>
     <div style={{...S.modal,position:"relative",maxHeight:"88vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
       <ModalHeader title="Sincronização" icon="🔗" onClose={onClose}/>
       {syncId?<div>
         <div style={{background:"#E8F4F0",borderRadius:12,padding:16,marginBottom:14,textAlign:"center"}}>
-          <div style={{fontSize:11,color:"#4A7D6E",marginBottom:6,textTransform:"uppercase",letterSpacing:1}}>Código de Sincronização</div>
-          <div style={{fontSize:12,fontWeight:700,color:"#3D2B1A",wordBreak:"break-all",fontFamily:"monospace",padding:"8px",background:"#fff",borderRadius:8,marginBottom:10,userSelect:"all",WebkitUserSelect:"all"}}>{syncId}</div>
-          <button style={{...S.miniBtn,borderColor:"#6B9E8E",color:"#6B9E8E"}} onClick={()=>{navigator.clipboard?.writeText(syncId).then(()=>alert("Código copiado!")).catch(()=>{const ta=document.createElement("textarea");ta.value=syncId;document.body.appendChild(ta);ta.select();document.execCommand("copy");document.body.removeChild(ta);alert("Código copiado!");});}}>📋 Copiar código</button>
+          <div style={{fontSize:11,color:"#4A7D6E",marginBottom:6,textTransform:"uppercase",letterSpacing:1}}>Chave de Encriptação</div>
+          <div style={{fontSize:11,fontWeight:700,color:"#3D2B1A",wordBreak:"break-all",fontFamily:"monospace",padding:"8px",background:"#fff",borderRadius:8,marginBottom:10,userSelect:"all",WebkitUserSelect:"all"}}>{encKey||syncId}</div>
+          <button style={{...S.miniBtn,borderColor:"#6B9E8E",color:"#6B9E8E"}} onClick={()=>{const txt=encKey||syncId;navigator.clipboard?.writeText(txt).then(()=>alert("Chave copiada!")).catch(()=>{const ta=document.createElement("textarea");ta.value=txt;document.body.appendChild(ta);ta.select();document.execCommand("copy");document.body.removeChild(ta);alert("Chave copiada!");});}}>📋 Copiar chave</button>
         </div>
-        <p style={{fontSize:12,color:"#9A7B6A",marginBottom:14,lineHeight:1.6,textAlign:"center"}}>Envia este código <strong>completo</strong> à Sara por WhatsApp.<br/>Ela cola em "Juntar sincronização" e pronto!</p>
+        <p style={{fontSize:12,color:"#9A7B6A",marginBottom:14,lineHeight:1.6,textAlign:"center"}}>Envia a <strong>chave</strong> e o <strong>token</strong> à Sara por WhatsApp.<br/>Ela cola ambos no outro telemóvel e fica ligada!</p>
+        {patInput}
         <div style={{background:"#E8F4F0",borderRadius:10,padding:"10px 14px",marginBottom:10}}>
-          <div style={{fontSize:11,color:"#4A7D6E",fontWeight:700}}>✅ Sincronização ativa {syncId.includes("#")&&"· 🔒 Cifrado E2E"}</div>
+          <div style={{fontSize:11,color:"#4A7D6E",fontWeight:700}}>✅ Sincronização ativa · 🔒 Cifrado E2E</div>
           <div style={{fontSize:11,color:"#6B9E8E",marginTop:3}}>{lastSyncAt?"Último sync: "+timeSince(lastSyncAt):"A aguardar primeiro sync..."}</div>
         </div>
         <div style={{display:"flex",gap:8,marginBottom:14}}>
@@ -750,12 +745,13 @@ function SyncModal({syncId,onSync,onJoin,onDisconnect,onClose,lastSyncAt,onSyncN
       </div>:<div>
         <p style={{fontSize:13,color:"#3D2B1A",marginBottom:8,lineHeight:1.6,textAlign:"center"}}>Sincroniza os dados entre os telemóveis do Vasco e da Sara.</p>
         <p style={{fontSize:11,color:"#4A7D6E",marginBottom:16,textAlign:"center",fontWeight:700}}>🔒 Cifrado end-to-end (AES-256)</p>
-        <button style={{...S.saveBtn,marginBottom:8}} disabled={creating} onClick={async()=>{setCreating(true);setTestResult(null);await onSync();if(LAST_SYNC_ERR)setTestResult({ok:false,msg:"❌ "+LAST_SYNC_ERR});setCreating(false);}}>{creating?"⏳ A criar…":"🆕 Criar nova sincronização"}</button>
+        {patInput}
+        <button style={{...S.saveBtn,marginBottom:8}} disabled={creating||!pat} onClick={async()=>{setCreating(true);setTestResult(null);await onSync();if(LAST_SYNC_ERR)setTestResult({ok:false,msg:"❌ "+LAST_SYNC_ERR});setCreating(false);}}>{creating?"⏳ A criar…":!pat?"⚠️ Insere o token primeiro":"🆕 Criar nova sincronização"}</button>
         {testResult&&!testResult.ok&&<div style={{background:"#FAEEE8",borderRadius:10,padding:"8px 12px",marginBottom:14,fontSize:11,color:"#C45A32",lineHeight:1.5}}>{testResult.msg}</div>}
         <div style={{borderTop:"1px solid #E0CEBE",paddingTop:14,marginTop:6}}>
-          <label style={S.fl}>Ou juntar a uma existente:</label>
-          <input style={S.inp} placeholder="Cola aqui o código completo" value={joinCode} onChange={e=>setJoinCode(e.target.value)}/>
-          <button style={{...S.saveBtn,background:"linear-gradient(135deg,#6B9E8E,#4A7D6E)"}} onClick={()=>{if(joinCode.trim()){onJoin(joinCode.trim());}else{alert("Cola o código de sincronização que recebeste.");}}}> 🔗 Juntar sincronização</button>
+          <label style={{...S.fl,marginBottom:4}}>Ou juntar a uma existente:</label>
+          <input style={{...S.inp,fontFamily:"monospace",fontSize:11}} placeholder="Cola aqui a chave de encriptação" value={joinCode} onChange={e=>setJoinCode(e.target.value)}/>
+          <button style={{...S.saveBtn,background:"linear-gradient(135deg,#6B9E8E,#4A7D6E)"}} disabled={!pat} onClick={()=>{if(!pat){alert("Insere o token GitHub primeiro.");return;}if(joinCode.trim()){onJoin(joinCode.trim());}else{alert("Cola a chave de encriptação que recebeste.");}}}>{!pat?"⚠️ Insere o token primeiro":"🔗 Juntar sincronização"}</button>
         </div>
       </div>}
       <button style={{...S.closeBtn,marginTop:8}} onClick={onClose}>Fechar</button>
@@ -1533,14 +1529,17 @@ function App(){
   },[state,toast$]);
 
   const handleSyncJoin=useCallback((code)=>{
-    localStorage.setItem(SYNC_ID_KEY,code);
-    setSyncId(code);
+    // If user pastes just the encryption key (no GH# prefix), add it
+    const full=code.startsWith("GH#")?code:"GH#"+code;
+    localStorage.setItem(SYNC_ID_KEY,full);
+    setSyncId(full);
     toast$("Sincronização ligada!");
     setSyncOpen(false);
   },[toast$]);
 
   const handleSyncDisconnect=useCallback(()=>{
     localStorage.removeItem(SYNC_ID_KEY);
+    localStorage.removeItem(GH_PAT_KEY);
     setSyncId("");
     toast$("Sincronização desligada");
     setSyncOpen(false);
