@@ -30,7 +30,7 @@ input,select,textarea{font-size:16px!important}
 <script type="text/babel" data-type="module">
 const{useState,useEffect,useCallback,useRef}=React;
 
-const APP_VERSION="17";
+const APP_VERSION="18";
 
 /* ============ SHARED MODAL HEADER ============ */
 function ModalHeader({title,onClose,icon}){
@@ -1379,12 +1379,22 @@ function App(){
       if(!remote?.data)return;
       setState(local=>{
         if(!local)return local;
-        // Merge: combine transactions by ID
-        const localIds=new Set(local.transactions.map(t=>t.id));
-        const remoteIds=new Set(remote.data.transactions?.map(t=>t.id)||[]);
-        const merged=[...local.transactions];
-        (remote.data.transactions||[]).forEach(t=>{if(!localIds.has(t.id))merged.push(t);});
-        const changed=merged.length!==local.transactions.length;
+        // Merge: combine transactions by ID, prefer newer edits
+        const localMap=new Map(local.transactions.map(t=>[t.id,t]));
+        const remoteTxs=remote.data.transactions||[];
+        let changed=false;
+        // Update existing + add new from remote
+        remoteTxs.forEach(rt=>{
+          const lt=localMap.get(rt.id);
+          if(!lt){localMap.set(rt.id,rt);changed=true;}
+          else if((rt.updatedAt||0)>(lt.updatedAt||0)){localMap.set(rt.id,rt);changed=true;}
+        });
+        // Also detect deletions: if remote has fewer, adopt remote set
+        if(remoteTxs.length<local.transactions.length){
+          const remoteIds=new Set(remoteTxs.map(t=>t.id));
+          local.transactions.forEach(t=>{if(!remoteIds.has(t.id)){localMap.delete(t.id);changed=true;}});
+        }
+        const merged=[...localMap.values()];
         if(changed){setSyncPulse(true);setTimeout(()=>setSyncPulse(false),3000);lastSave.current=Date.now();}
         const newState={...local,transactions:merged,goals:[...(remote.data.goals||local.goals)],recurring:[...(remote.data.recurring||local.recurring)]};
         if(changed)saveLocal(newState);
@@ -1458,8 +1468,9 @@ function App(){
   },[toast$]);
   const delTx=useCallback(id=>{setState(s=>({...s,transactions:s.transactions.filter(t=>t.id!==id)}));setDetailTx(null);toast$("Eliminado","warn");},[toast$]);
   const editTx=useCallback((id,updates)=>{
-    setState(s=>({...s,transactions:s.transactions.map(t=>t.id===id?{...t,...updates}:t)}));
-    setDetailTx(prev=>prev&&prev.id===id?{...prev,...updates}:prev);
+    const withTs={...updates,updatedAt:Date.now()};
+    setState(s=>({...s,transactions:s.transactions.map(t=>t.id===id?{...t,...withTs}:t)}));
+    setDetailTx(prev=>prev&&prev.id===id?{...prev,...withTs}:prev);
     toast$("Movimento atualizado");
   },[toast$]);
   const saveBdg=useCallback((cat,amt)=>setState(s=>({...s,budgets:{...s.budgets,[`${fMonth}:${cat}`]:amt}})),[fMonth]);
@@ -1903,7 +1914,7 @@ function App(){
       {budgetOpen&&<BudgetModal month={fMonth} ml={ml} budgets={state.budgets} onSave={saveBdg} onClose={()=>setBudgetOpen(false)}/>}
       {goalOpen&&<GoalModal onSave={addGoal} onClose={()=>setGoalOpen(false)}/>}
       {recurOpen&&<RecurModal onSave={saveRecur} onClose={()=>setRecurOpen(false)}/>}
-      {syncOpen&&<SyncModal syncId={syncId} onSync={handleSyncCreate} onJoin={handleSyncJoin} onDisconnect={handleSyncDisconnect} onClose={()=>setSyncOpen(false)} lastSyncAt={lastSyncAt} onSyncNow={async()=>{if(!state)return;const ok=await syncWrite(state);if(ok){setLastSyncAt(Date.now());toast$("Dados enviados");const r=await syncRead();if(r?.data){setState(local=>{const localIds=new Set(local.transactions.map(t=>t.id));const merged=[...local.transactions];(r.data.transactions||[]).forEach(t=>{if(!localIds.has(t.id))merged.push(t);});if(merged.length!==local.transactions.length){setSyncPulse(true);setTimeout(()=>setSyncPulse(false),3000);const ns={...local,transactions:merged,goals:[...(r.data.goals||local.goals)],recurring:[...(r.data.recurring||local.recurring)]};saveLocal(ns);return ns;}return local;});}}else{toast$("Erro ao sincronizar","warn");}}}/>}
+      {syncOpen&&<SyncModal syncId={syncId} onSync={handleSyncCreate} onJoin={handleSyncJoin} onDisconnect={handleSyncDisconnect} onClose={()=>setSyncOpen(false)} lastSyncAt={lastSyncAt} onSyncNow={async()=>{if(!state)return;const ok=await syncWrite(state);if(ok){setLastSyncAt(Date.now());toast$("Dados enviados");const r=await syncRead();if(r?.data){setState(local=>{const localMap=new Map(local.transactions.map(t=>[t.id,t]));const remoteTxs=r.data.transactions||[];let changed=false;remoteTxs.forEach(rt=>{const lt=localMap.get(rt.id);if(!lt){localMap.set(rt.id,rt);changed=true;}else if((rt.updatedAt||0)>(lt.updatedAt||0)){localMap.set(rt.id,rt);changed=true;}});if(remoteTxs.length<local.transactions.length){const remoteIds=new Set(remoteTxs.map(t=>t.id));local.transactions.forEach(t=>{if(!remoteIds.has(t.id)){localMap.delete(t.id);changed=true;}});}const merged=[...localMap.values()];if(changed){setSyncPulse(true);setTimeout(()=>setSyncPulse(false),3000);const ns={...local,transactions:merged,goals:[...(r.data.goals||local.goals)],recurring:[...(r.data.recurring||local.recurring)]};saveLocal(ns);return ns;}return local;});}}else{toast$("Erro ao sincronizar","warn");}}}/>}
       {settingsOpen&&<SettingsModal notifsEnabled={notifsEnabled} onToggleNotifs={handleToggleNotifs} onOpenSync={()=>{setSettingsOpen(false);setSyncOpen(true);}} onOpenCatModal={()=>{setSettingsOpen(false);setCatModalOpen(true);}} darkMode={darkMode} onToggleDarkMode={handleToggleDarkMode} onClose={()=>setSettingsOpen(false)} onExport={handleExport} onImport={handleImport} lastSyncAt={lastSyncAt} syncId={syncId}/>}
       {catModalOpen&&<CategoryModal customCats={customCats} onAddCat={addCustomCat} onDelCat={delCustomCat} darkMode={darkMode} onClose={()=>setCatModalOpen(false)}/>}
     </div>

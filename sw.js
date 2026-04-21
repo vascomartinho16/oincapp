@@ -1,4 +1,4 @@
-const CACHE_NAME = 'familia-martinho-v17';
+const CACHE_NAME = 'familia-martinho-v18';
 const CDN_ASSETS = [
   'https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js',
   'https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js',
