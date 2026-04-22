@@ -1,4 +1,4 @@
-const CACHE_NAME = 'familia-martinho-v19';
+const CACHE_NAME = 'familia-martinho-v20';
 const CDN_ASSETS = [
   'https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js',
   'https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js',
@@ -26,7 +26,7 @@ self.addEventListener('fetch', event => {
   const url = new URL(event.request.url);
 
   // API calls (sync backends): network only, no cache
-  if (url.hostname.includes('jsonblob') || url.hostname.includes('npoint') || url.hostname.includes('ntfy')) {
+  if (url.hostname.includes('jsonblob') || url.hostname.includes('npoint') || url.hostname.includes('ntfy') || url.hostname.includes('github')) {
     event.respondWith(fetch(event.request));
     return;
   }

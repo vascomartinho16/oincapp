@@ -30,7 +30,7 @@ input,select,textarea{font-size:16px!important}
 <script type="text/babel" data-type="module">
 const{useState,useEffect,useCallback,useRef}=React;
 
-const APP_VERSION="19";
+const APP_VERSION="20";
 
 /* ============ SHARED MODAL HEADER ============ */
 function ModalHeader({title,onClose,icon}){
@@ -277,34 +277,44 @@ async function decryptPayload(obj,keyB64){
 function getGHPat(){return localStorage.getItem(GH_PAT_KEY)||"";}
 
 async function ghRead(){
-  // Read via raw.githubusercontent.com (no auth needed, public repo)
-  const res=await fetch("https://raw.githubusercontent.com/"+GH_REPO+"/main/"+GH_FILE+"?t="+Date.now(),{cache:"no-store"});
-  if(res.status===404)return null; // file doesn't exist yet
+  // Use API endpoint (not raw.githubusercontent which has 5min CDN cache)
+  const pat=getGHPat();
+  const headers={"Accept":"application/vnd.github+json"};
+  if(pat)headers["Authorization"]="token "+pat;
+  const res=await fetch("https://api.github.com/repos/"+GH_REPO+"/contents/"+GH_FILE+"?t="+Date.now(),{headers,cache:"no-store"});
+  if(res.status===404)return{content:null,sha:null};
   if(!res.ok)throw new Error("GitHub read HTTP "+res.status);
-  return await res.json();
+  const j=await res.json();
+  const decoded=JSON.parse(decodeURIComponent(escape(atob(j.content.replace(/\n/g,"")))));
+  return{content:decoded,sha:j.sha};
 }
 
-async function ghWrite(content){
+async function ghWrite(content,expectedSha){
   const pat=getGHPat();
   if(!pat)throw new Error("GitHub PAT não configurado");
-  // Get current file SHA (needed for updates)
-  let sha=null;
-  try{
-    const meta=await fetch("https://api.github.com/repos/"+GH_REPO+"/contents/"+GH_FILE,{
-      headers:{"Authorization":"token "+pat,"Accept":"application/vnd.github+json"}
-    });
-    if(meta.ok){const j=await meta.json();sha=j.sha;}
-  }catch{}
-  // Write file
   const body={message:"sync update",content:btoa(unescape(encodeURIComponent(JSON.stringify(content,null,0))))};
-  if(sha)body.sha=sha;
+  if(expectedSha)body.sha=expectedSha;
   const res=await fetch("https://api.github.com/repos/"+GH_REPO+"/contents/"+GH_FILE,{
     method:"PUT",
     headers:{"Authorization":"token "+pat,"Accept":"application/vnd.github+json","Content-Type":"application/json"},
     body:JSON.stringify(body)
   });
+  if(res.status===409)throw new Error("CONFLICT");
   if(!res.ok){const t=await res.text().catch(()=>"");throw new Error("GitHub write HTTP "+res.status+" "+t.slice(0,100));}
-  return true;
+  const j=await res.json();
+  return j.content?.sha||null;
+}
+
+// Merge two transaction arrays: union by ID, prefer newer edits
+function mergeTxArrays(localTxs,remoteTxs){
+  const map=new Map(localTxs.map(t=>[t.id,t]));
+  let changed=false;
+  (remoteTxs||[]).forEach(rt=>{
+    const lt=map.get(rt.id);
+    if(!lt){map.set(rt.id,rt);changed=true;}
+    else if((rt.updatedAt||0)>(lt.updatedAt||0)){map.set(rt.id,rt);changed=true;}
+  });
+  return{merged:[...map.values()],changed};
 }
 
 async function syncCreate(data){
@@ -315,7 +325,9 @@ async function syncCreate(data){
     const keyB64=await genSyncKey();
     const enc=await encryptPayload(data,keyB64);
     const body={ts:Date.now(),...enc};
-    await ghWrite(body);
+    // Read existing SHA first (in case sync.json already exists)
+    const existing=await ghRead();
+    await ghWrite(body,existing.sha);
     const syncId="GH#"+keyB64;
     localStorage.setItem(SYNC_ID_KEY,syncId);
     return syncId;
@@ -332,28 +344,55 @@ async function syncRead(){
   const key=full.startsWith("GH#")?full.slice(3):null;
   if(!key)return null;
   try{
-    const body=await ghRead();
-    if(!body)return null;
-    if(body.enc==="v1"){
-      const data=await decryptPayload(body,key);
-      return{ts:body.ts,data};
+    const{content,sha}=await ghRead();
+    if(!content)return null;
+    if(content.enc==="v1"){
+      const data=await decryptPayload(content,key);
+      return{ts:content.ts,data,sha};
     }
-    return body;
+    return{...content,sha};
   }catch(e){console.error("syncRead:",e);return null;}
 }
 
-async function syncWrite(data){
+// Read-merge-write: reads remote, merges with local, writes merged result
+// Returns {merged, changed} or false on failure
+async function syncPush(localData){
   const full=localStorage.getItem(SYNC_ID_KEY);
   if(!full)return false;
   const key=full.startsWith("GH#")?full.slice(3):null;
   if(!key)return false;
-  try{
-    const enc=await encryptPayload(data,key);
-    const body={ts:Date.now(),...enc};
-    await ghWrite(body);
-    localStorage.setItem("fm_last_sync",String(Date.now()));
-    return true;
-  }catch(e){console.error("syncWrite:",e);return false;}
+  const maxRetries=3;
+  for(let attempt=0;attempt<maxRetries;attempt++){
+    try{
+      // 1. Read remote
+      const{content,sha}=await ghRead();
+      let mergedData=localData;
+      let changed=false;
+      // 2. If remote exists, merge remote transactions into local
+      if(content&&content.enc==="v1"){
+        try{
+          const remoteData=await decryptPayload(content,key);
+          const result=mergeTxArrays(localData.transactions||[],remoteData.transactions||[]);
+          mergedData={...localData,transactions:result.merged,goals:[...(localData.goals||[])],recurring:[...(localData.recurring||[])]};
+          changed=result.changed;
+        }catch(decErr){console.warn("syncPush decrypt failed, overwriting:",decErr);}
+      }
+      // 3. Encrypt and write merged data
+      const enc=await encryptPayload(mergedData,key);
+      const body={ts:Date.now(),...enc};
+      await ghWrite(body,sha);
+      localStorage.setItem("fm_last_sync",String(Date.now()));
+      return{merged:mergedData,changed};
+    }catch(e){
+      if(e.message==="CONFLICT"&&attempt<maxRetries-1){
+        console.log("syncPush SHA conflict, retrying (attempt "+(attempt+2)+")...");
+        continue; // retry with fresh SHA
+      }
+      console.error("syncPush:",e);
+      return false;
+    }
+  }
+  return false;
 }
 
 // ============ IN-APP DAILY REMINDER (works on all devices incl. iOS) ============
@@ -1371,44 +1410,54 @@ function App(){
   // Save on change
   useEffect(()=>{if(!state)return;const n=Date.now();if(n-lastSave.current<300)return;lastSave.current=n;saveLocal(state);},[state]);
 
-  // Sync polling
+  // Sync polling — read remote, merge into local
   useEffect(()=>{
     if(!syncId){clearInterval(pollRef.current);return;}
     const poll=async()=>{
-      const remote=await syncRead();
-      if(!remote?.data)return;
-      setState(local=>{
-        if(!local)return local;
-        // Merge: combine transactions by ID, prefer newer edits
-        const localMap=new Map(local.transactions.map(t=>[t.id,t]));
-        const remoteTxs=remote.data.transactions||[];
-        let changed=false;
-        // Update existing + add new from remote (never delete local)
-        remoteTxs.forEach(rt=>{
-          const lt=localMap.get(rt.id);
-          if(!lt){localMap.set(rt.id,rt);changed=true;}
-          else if((rt.updatedAt||0)>(lt.updatedAt||0)){localMap.set(rt.id,rt);changed=true;}
+      try{
+        const remote=await syncRead();
+        if(!remote?.data)return;
+        setState(local=>{
+          if(!local)return local;
+          const{merged,changed}=mergeTxArrays(local.transactions,remote.data.transactions||[]);
+          if(!changed)return local;
+          setSyncPulse(true);setTimeout(()=>setSyncPulse(false),3000);
+          lastSave.current=Date.now();
+          const newState={...local,transactions:merged,goals:[...(remote.data.goals||local.goals)],recurring:[...(remote.data.recurring||local.recurring)]};
+          saveLocal(newState);
+          return newState;
         });
-        const merged=[...localMap.values()];
-        if(changed){setSyncPulse(true);setTimeout(()=>setSyncPulse(false),3000);lastSave.current=Date.now();}
-        const newState={...local,transactions:merged,goals:[...(remote.data.goals||local.goals)],recurring:[...(remote.data.recurring||local.recurring)]};
-        if(changed)saveLocal(newState);
-        return changed?newState:local;
-      });
+      }catch(e){console.error("poll error:",e);}
     };
     poll();
-    pollRef.current=setInterval(poll,15000);
+    pollRef.current=setInterval(poll,20000);
     return()=>clearInterval(pollRef.current);
   },[syncId]);
 
-  // Push to sync on state change
+  // Push to sync on state change — read-merge-write (never overwrites remote data)
+  const pushRef=useRef(null);
   useEffect(()=>{
     if(!state||!syncId)return;
-    const t=setTimeout(async()=>{
-      const ok=await syncWrite(state);
-      if(ok)setLastSyncAt(Date.now());
-    },2000);
-    return()=>clearTimeout(t);
+    clearTimeout(pushRef.current);
+    pushRef.current=setTimeout(async()=>{
+      const result=await syncPush(state);
+      if(result){
+        setLastSyncAt(Date.now());
+        // If remote had transactions we didn't have, update local state
+        if(result.changed){
+          setState(local=>{
+            if(!local)return local;
+            const{merged,changed}=mergeTxArrays(local.transactions,result.merged.transactions||[]);
+            if(!changed)return local;
+            setSyncPulse(true);setTimeout(()=>setSyncPulse(false),3000);
+            const ns={...local,transactions:merged};
+            saveLocal(ns);
+            return ns;
+          });
+        }
+      }
+    },3000);
+    return()=>clearTimeout(pushRef.current);
   },[state,syncId]);
 
   // Online/offline listeners
@@ -1909,7 +1958,7 @@ function App(){
       {budgetOpen&&<BudgetModal month={fMonth} ml={ml} budgets={state.budgets} onSave={saveBdg} onClose={()=>setBudgetOpen(false)}/>}
       {goalOpen&&<GoalModal onSave={addGoal} onClose={()=>setGoalOpen(false)}/>}
       {recurOpen&&<RecurModal onSave={saveRecur} onClose={()=>setRecurOpen(false)}/>}
-      {syncOpen&&<SyncModal syncId={syncId} onSync={handleSyncCreate} onJoin={handleSyncJoin} onDisconnect={handleSyncDisconnect} onClose={()=>setSyncOpen(false)} lastSyncAt={lastSyncAt} onSyncNow={async()=>{if(!state)return;const ok=await syncWrite(state);if(ok){setLastSyncAt(Date.now());toast$("Dados enviados");const r=await syncRead();if(r?.data){setState(local=>{const localMap=new Map(local.transactions.map(t=>[t.id,t]));const remoteTxs=r.data.transactions||[];let changed=false;remoteTxs.forEach(rt=>{const lt=localMap.get(rt.id);if(!lt){localMap.set(rt.id,rt);changed=true;}else if((rt.updatedAt||0)>(lt.updatedAt||0)){localMap.set(rt.id,rt);changed=true;}});const merged=[...localMap.values()];if(changed){setSyncPulse(true);setTimeout(()=>setSyncPulse(false),3000);const ns={...local,transactions:merged,goals:[...(r.data.goals||local.goals)],recurring:[...(r.data.recurring||local.recurring)]};saveLocal(ns);return ns;}return local;});}}else{toast$("Erro ao sincronizar","warn");}}}/>}
+      {syncOpen&&<SyncModal syncId={syncId} onSync={handleSyncCreate} onJoin={handleSyncJoin} onDisconnect={handleSyncDisconnect} onClose={()=>setSyncOpen(false)} lastSyncAt={lastSyncAt} onSyncNow={async()=>{if(!state)return;const result=await syncPush(state);if(result){setLastSyncAt(Date.now());toast$("Dados sincronizados");if(result.changed){setState(local=>{if(!local)return local;const{merged,changed}=mergeTxArrays(local.transactions,result.merged.transactions||[]);if(!changed)return local;setSyncPulse(true);setTimeout(()=>setSyncPulse(false),3000);const ns={...local,transactions:merged};saveLocal(ns);return ns;});}}else{toast$("Erro ao sincronizar","warn");}}}/>}
       {settingsOpen&&<SettingsModal notifsEnabled={notifsEnabled} onToggleNotifs={handleToggleNotifs} onOpenSync={()=>{setSettingsOpen(false);setSyncOpen(true);}} onOpenCatModal={()=>{setSettingsOpen(false);setCatModalOpen(true);}} darkMode={darkMode} onToggleDarkMode={handleToggleDarkMode} onClose={()=>setSettingsOpen(false)} onExport={handleExport} onImport={handleImport} lastSyncAt={lastSyncAt} syncId={syncId}/>}
       {catModalOpen&&<CategoryModal customCats={customCats} onAddCat={addCustomCat} onDelCat={delCustomCat} darkMode={darkMode} onClose={()=>setCatModalOpen(false)}/>}
     </div>
