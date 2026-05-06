@@ -30,7 +30,7 @@ input,select,textarea{font-size:16px!important}
 <script type="text/babel" data-type="module">
 const{useState,useEffect,useCallback,useRef}=React;
 
-const APP_VERSION="20";
+const APP_VERSION="21";
 
 /* ============ SHARED MODAL HEADER ============ */
 function ModalHeader({title,onClose,icon}){
@@ -354,6 +354,24 @@ async function syncRead(){
   }catch(e){console.error("syncRead:",e);return null;}
 }
 
+// Merge full state objects (transactions, goals, recurring)
+function mergeStates(local,remote){
+  const txResult=mergeTxArrays(local.transactions||[],remote.transactions||[]);
+  // Goals/recurring: merge by ID too, prefer newer
+  const mergeById=(la,ra)=>{
+    const map=new Map((la||[]).map(g=>[g.id||JSON.stringify(g),g]));
+    let ch=false;
+    (ra||[]).forEach(rg=>{const k=rg.id||JSON.stringify(rg);if(!map.has(k)){map.set(k,rg);ch=true;}});
+    return{arr:[...map.values()],changed:ch};
+  };
+  const goalsR=mergeById(local.goals,remote.goals);
+  const recurR=mergeById(local.recurring,remote.recurring);
+  return{
+    merged:{...local,transactions:txResult.merged,goals:goalsR.arr,recurring:recurR.arr,budgets:{...(remote.budgets||{}),...(local.budgets||{})}},
+    changed:txResult.changed||goalsR.changed||recurR.changed
+  };
+}
+
 // Read-merge-write: reads remote, merges with local, writes merged result
 // Returns {merged, changed} or false on failure
 async function syncPush(localData){
@@ -361,6 +379,7 @@ async function syncPush(localData){
   if(!full)return false;
   const key=full.startsWith("GH#")?full.slice(3):null;
   if(!key)return false;
+  LAST_SYNC_ERR="";
   const maxRetries=3;
   for(let attempt=0;attempt<maxRetries;attempt++){
     try{
@@ -368,12 +387,12 @@ async function syncPush(localData){
       const{content,sha}=await ghRead();
       let mergedData=localData;
       let changed=false;
-      // 2. If remote exists, merge remote transactions into local
+      // 2. If remote exists, merge remote into local
       if(content&&content.enc==="v1"){
         try{
           const remoteData=await decryptPayload(content,key);
-          const result=mergeTxArrays(localData.transactions||[],remoteData.transactions||[]);
-          mergedData={...localData,transactions:result.merged,goals:[...(localData.goals||[])],recurring:[...(localData.recurring||[])]};
+          const result=mergeStates(localData,remoteData);
+          mergedData=result.merged;
           changed=result.changed;
         }catch(decErr){console.warn("syncPush decrypt failed, overwriting:",decErr);}
       }
@@ -386,8 +405,9 @@ async function syncPush(localData){
     }catch(e){
       if(e.message==="CONFLICT"&&attempt<maxRetries-1){
         console.log("syncPush SHA conflict, retrying (attempt "+(attempt+2)+")...");
-        continue; // retry with fresh SHA
+        continue;
       }
+      LAST_SYNC_ERR=e.message;
       console.error("syncPush:",e);
       return false;
     }
@@ -746,9 +766,20 @@ function SyncModal({syncId,onSync,onJoin,onDisconnect,onClose,lastSyncAt,onSyncN
   const doTest=async()=>{
     setSyncing(true);setTestResult(null);
     try{
+      // Test read
       const r=await syncRead();
-      if(r&&r.data){setTestResult({ok:true,msg:"✅ Ligação OK — "+((r.data.transactions||[]).length)+" movimentos no servidor"});}
-      else{setTestResult({ok:false,msg:"⚠️ Servidor respondeu vazio"+(LAST_SYNC_ERR?" — "+LAST_SYNC_ERR:"")});}
+      if(!r||!r.data){setTestResult({ok:false,msg:"⚠️ Leitura falhou"+(LAST_SYNC_ERR?" — "+LAST_SYNC_ERR:"")});setSyncing(false);return;}
+      const txCount=(r.data.transactions||[]).length;
+      // Test write (read-merge-write with current data to verify PAT has write access)
+      const{content,sha}=await ghRead();
+      try{
+        const testBody={...content,_test:Date.now()};
+        // Just verify we CAN write by writing back the same data
+        await ghWrite(content||{ts:Date.now()},sha);
+        setTestResult({ok:true,msg:"✅ Leitura OK ("+txCount+" movimentos) · Escrita OK"});
+      }catch(we){
+        setTestResult({ok:false,msg:"⚠️ Leitura OK ("+txCount+" mov.) mas ESCRITA FALHOU: "+we.message});
+      }
     }catch(e){setTestResult({ok:false,msg:"❌ Erro: "+e.message});}
     setSyncing(false);
   };
@@ -1410,7 +1441,12 @@ function App(){
   // Save on change
   useEffect(()=>{if(!state)return;const n=Date.now();if(n-lastSave.current<300)return;lastSave.current=n;saveLocal(state);},[state]);
 
-  // Sync polling — read remote, merge into local
+  // Sync: poll reads remote and merges; push writes local to remote
+  const pushRef=useRef(null);
+  const pushingRef=useRef(false);   // prevent concurrent pushes
+  const fromPollRef=useRef(false);  // skip push when state changed from poll
+
+  // Poll: read remote, merge into local
   useEffect(()=>{
     if(!syncId){clearInterval(pollRef.current);return;}
     const poll=async()=>{
@@ -1419,44 +1455,49 @@ function App(){
         if(!remote?.data)return;
         setState(local=>{
           if(!local)return local;
-          const{merged,changed}=mergeTxArrays(local.transactions,remote.data.transactions||[]);
-          if(!changed)return local;
+          const result=mergeStates(local,remote.data);
+          if(!result.changed)return local;
+          fromPollRef.current=true; // flag: this state change came from poll, don't push it back
           setSyncPulse(true);setTimeout(()=>setSyncPulse(false),3000);
           lastSave.current=Date.now();
-          const newState={...local,transactions:merged,goals:[...(remote.data.goals||local.goals)],recurring:[...(remote.data.recurring||local.recurring)]};
-          saveLocal(newState);
-          return newState;
+          setLastSyncAt(Date.now());
+          saveLocal(result.merged);
+          return result.merged;
         });
       }catch(e){console.error("poll error:",e);}
     };
     poll();
-    pollRef.current=setInterval(poll,20000);
+    pollRef.current=setInterval(poll,15000);
     return()=>clearInterval(pollRef.current);
   },[syncId]);
 
-  // Push to sync on state change — read-merge-write (never overwrites remote data)
-  const pushRef=useRef(null);
+  // Push: on state change, write to remote (read-merge-write)
   useEffect(()=>{
     if(!state||!syncId)return;
+    // Skip push if this state change came from poll (already on server)
+    if(fromPollRef.current){fromPollRef.current=false;return;}
     clearTimeout(pushRef.current);
     pushRef.current=setTimeout(async()=>{
-      const result=await syncPush(state);
-      if(result){
-        setLastSyncAt(Date.now());
-        // If remote had transactions we didn't have, update local state
-        if(result.changed){
-          setState(local=>{
-            if(!local)return local;
-            const{merged,changed}=mergeTxArrays(local.transactions,result.merged.transactions||[]);
-            if(!changed)return local;
-            setSyncPulse(true);setTimeout(()=>setSyncPulse(false),3000);
-            const ns={...local,transactions:merged};
-            saveLocal(ns);
-            return ns;
-          });
+      if(pushingRef.current)return; // another push in-flight, skip
+      pushingRef.current=true;
+      try{
+        const result=await syncPush(state);
+        if(result){
+          setLastSyncAt(Date.now());
+          if(result.changed){
+            fromPollRef.current=true; // don't re-push this merge
+            setState(local=>{
+              if(!local)return local;
+              const r=mergeStates(local,result.merged);
+              if(!r.changed)return local;
+              setSyncPulse(true);setTimeout(()=>setSyncPulse(false),3000);
+              saveLocal(r.merged);
+              return r.merged;
+            });
+          }
         }
-      }
-    },3000);
+      }finally{pushingRef.current=false;}
+    },2000);
     return()=>clearTimeout(pushRef.current);
   },[state,syncId]);
 
@@ -1958,7 +1999,7 @@ function App(){
       {budgetOpen&&<BudgetModal month={fMonth} ml={ml} budgets={state.budgets} onSave={saveBdg} onClose={()=>setBudgetOpen(false)}/>}
       {goalOpen&&<GoalModal onSave={addGoal} onClose={()=>setGoalOpen(false)}/>}
       {recurOpen&&<RecurModal onSave={saveRecur} onClose={()=>setRecurOpen(false)}/>}
-      {syncOpen&&<SyncModal syncId={syncId} onSync={handleSyncCreate} onJoin={handleSyncJoin} onDisconnect={handleSyncDisconnect} onClose={()=>setSyncOpen(false)} lastSyncAt={lastSyncAt} onSyncNow={async()=>{if(!state)return;const result=await syncPush(state);if(result){setLastSyncAt(Date.now());toast$("Dados sincronizados");if(result.changed){setState(local=>{if(!local)return local;const{merged,changed}=mergeTxArrays(local.transactions,result.merged.transactions||[]);if(!changed)return local;setSyncPulse(true);setTimeout(()=>setSyncPulse(false),3000);const ns={...local,transactions:merged};saveLocal(ns);return ns;});}}else{toast$("Erro ao sincronizar","warn");}}}/>}
+      {syncOpen&&<SyncModal syncId={syncId} onSync={handleSyncCreate} onJoin={handleSyncJoin} onDisconnect={handleSyncDisconnect} onClose={()=>setSyncOpen(false)} lastSyncAt={lastSyncAt} onSyncNow={async()=>{if(!state)return;const result=await syncPush(state);if(result){setLastSyncAt(Date.now());toast$("Dados sincronizados"+(result.changed?" (novos dados recebidos)":""));if(result.changed){fromPollRef.current=true;setState(local=>{if(!local)return local;const r=mergeStates(local,result.merged);if(!r.changed)return local;setSyncPulse(true);setTimeout(()=>setSyncPulse(false),3000);saveLocal(r.merged);return r.merged;});}}else{toast$(LAST_SYNC_ERR?"Erro: "+LAST_SYNC_ERR:"Erro ao sincronizar","warn");}}}/>}
       {settingsOpen&&<SettingsModal notifsEnabled={notifsEnabled} onToggleNotifs={handleToggleNotifs} onOpenSync={()=>{setSettingsOpen(false);setSyncOpen(true);}} onOpenCatModal={()=>{setSettingsOpen(false);setCatModalOpen(true);}} darkMode={darkMode} onToggleDarkMode={handleToggleDarkMode} onClose={()=>setSettingsOpen(false)} onExport={handleExport} onImport={handleImport} lastSyncAt={lastSyncAt} syncId={syncId}/>}
       {catModalOpen&&<CategoryModal customCats={customCats} onAddCat={addCustomCat} onDelCat={delCustomCat} darkMode={darkMode} onClose={()=>setCatModalOpen(false)}/>}
     </div>
